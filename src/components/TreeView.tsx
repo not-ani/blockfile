@@ -70,7 +70,7 @@ const AuthorIcon = () => (
 export default function TreeView(props: TreeViewProps) {
   return (
     <div
-      class="h-full min-h-0 overflow-auto px-5 pb-5 pt-2 outline-none focus-visible:ring-2 focus-visible:ring-blue-500/30"
+      class="h-full min-h-0 overflow-auto px-3 pb-3 pt-1 outline-none focus-visible:ring-2 focus-visible:ring-blue-500/30"
       onKeyDown={props.onTreeKeyDown}
       onScroll={(event) => props.onTreeScroll(event.currentTarget.scrollTop)}
       ref={props.setTreeRef}
@@ -170,6 +170,11 @@ export default function TreeView(props: TreeViewProps) {
               <Show when={focused() && (isHeading() || isF8() || isAuthor())}>
                 <span class="vercel-badge opacity-0 transition-opacity group-hover:opacity-100">
                   Space to insert
+                </span>
+              </Show>
+              <Show when={props.searchMode() && row.searchResult && row.searchResult.source !== "lexical"}>
+                <span class="vercel-badge border-indigo-500/30 bg-indigo-500/10 text-indigo-300">
+                  {row.searchResult?.source === "hybrid" ? "AI + Lex" : "AI Match"}
                 </span>
               </Show>
             </button>

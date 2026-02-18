@@ -26,6 +26,7 @@ type SnapshotIndex = {
 type BuildTreeRowsArgs = {
   snapshotIndex: SnapshotIndex | null;
   searchMode: boolean;
+  searchFileNamesOnly: boolean;
   searchResults: SearchHit[];
   previewCache: Record<number, FilePreview>;
   expandedFolders: Set<string>;
@@ -75,6 +76,7 @@ export const buildTreeRows = (args: BuildTreeRowsArgs): TreeRow[] => {
   const {
     snapshotIndex,
     searchMode,
+    searchFileNamesOnly,
     searchResults,
     previewCache,
     expandedFolders,
@@ -126,6 +128,72 @@ export const buildTreeRows = (args: BuildTreeRowsArgs): TreeRow[] => {
         sourcePath: result.absolutePath,
         searchResult: result,
       });
+
+      if (searchFileNamesOnly) {
+        const preview = previewCache[file.id];
+        if (!preview) {
+          pushRow({
+            key: `search:loading:file-preview:${file.id}`,
+            kind: "loading",
+            depth: fileDepth + 1,
+            label: "Loading file context...",
+            fileId: file.id,
+          });
+          continue;
+        }
+
+        const orderedHeadings = [...preview.headings].sort((left, right) => left.order - right.order);
+        const depthByHeadingIndex = new Array<number>(orderedHeadings.length).fill(0);
+        const hasChildrenByHeadingIndex = new Array<boolean>(orderedHeadings.length).fill(false);
+        const indexStack: number[] = [];
+
+        for (let index = 0; index < orderedHeadings.length; index += 1) {
+          const currentHeading = orderedHeadings[index];
+          while (
+            indexStack.length > 0 &&
+            orderedHeadings[indexStack[indexStack.length - 1]].level >= currentHeading.level
+          ) {
+            indexStack.pop();
+          }
+
+          depthByHeadingIndex[index] = indexStack.length;
+          if (indexStack.length > 0) {
+            hasChildrenByHeadingIndex[indexStack[indexStack.length - 1]] = true;
+          }
+          indexStack.push(index);
+        }
+
+        orderedHeadings.forEach((heading, index) => {
+          pushRow({
+            key: `search:file-context:heading:${file.id}:${heading.id}:${heading.order}:${heading.level}`,
+            kind: "heading",
+            depth: fileDepth + 1 + depthByHeadingIndex[index],
+            label: heading.text,
+            subLabel: headingLevelLabel(heading.level),
+            headingLevel: heading.level,
+            headingOrder: heading.order,
+            fileId: file.id,
+            copyText: heading.copyText || heading.text,
+            sourcePath: preview.absolutePath,
+            hasChildren: hasChildrenByHeadingIndex[index],
+          });
+        });
+
+        preview.f8Cites.forEach((cite, index) => {
+          pushRow({
+            key: `search:file-context:f8:${file.id}:${cite.order}:${index}`,
+            kind: "f8",
+            depth: fileDepth + 1,
+            label: cite.text,
+            subLabel: cite.styleLabel,
+            fileId: file.id,
+            copyText: cite.text,
+            sourcePath: preview.absolutePath,
+          });
+        });
+
+        continue;
+      }
 
       if (result.kind === "heading" && result.headingText) {
         const preview = previewCache[file.id];

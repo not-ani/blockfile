@@ -81,15 +81,25 @@
   }
 
   .workspace-split {
-    @apply grid gap-4;
-    grid-template-columns: minmax(0, 1fr);
+    @apply flex;
   }
 
-  @media (min-width: 1024px) {
-    .workspace-split {
-      gap: 0;
-      grid-template-columns: minmax(420px, var(--left-rail-width, 560px)) 14px minmax(0, 1fr);
+  .workspace-split > aside {
+    width: var(--left-rail-width, 320px);
+    min-width: 0;
+    max-width: 480px;
+    transition: width 0.15s ease-out;
+  }
+
+  @media (max-width: 1023px) {
+    .workspace-split > aside {
+      width: 100%;
+      max-width: none;
     }
+  }
+
+  .workspace-split > aside:empty {
+    display: none;
   }
 
   .panel-resize-handle {
@@ -113,7 +123,7 @@
   }
   
   .tree-row {
-    @apply flex h-11 w-full items-center gap-3 rounded-lg px-3 text-left transition-all duration-150;
+    @apply flex h-9 w-full items-center gap-2 rounded-md px-2 text-left transition-all duration-150;
   }
   
   .tree-row:hover {

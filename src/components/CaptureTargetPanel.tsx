@@ -61,7 +61,7 @@ function PreviewHeadingRow(props: PreviewHeadingRowProps) {
 
   return (
     <div
-      class={`group flex items-center gap-3 rounded-lg border px-3 py-2 transition-all ${
+      class={`group flex items-center gap-2 rounded border px-2 py-1.5 transition-all ${
         isDropTarget()
           ? "border-blue-500/50 bg-blue-500/10"
           : props.isSelected
@@ -72,22 +72,22 @@ function PreviewHeadingRow(props: PreviewHeadingRowProps) {
     >
       <button
         aria-label={`Drag ${props.heading.text}`}
-        class="cursor-grab rounded p-1 text-neutral-600 transition hover:text-neutral-400 active:cursor-grabbing"
+        class="cursor-grab rounded p-0.5 text-neutral-600 transition hover:text-neutral-400 active:cursor-grabbing"
         disabled={props.isBusy}
         ref={handleRef}
         type="button"
       >
-        <svg class="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <svg class="h-3 w-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
           <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 8h16M4 16h16" />
         </svg>
       </button>
       <button
-        class="min-w-0 flex-1 rounded py-1 text-left"
+        class="min-w-0 flex-1 rounded py-0.5 text-left"
         onClick={() => props.setSelectedCaptureHeadingOrder(props.heading.order)}
-        style={{ "padding-left": `${Math.max(0, props.heading.level - 1) * 16}px` }}
+        style={{ "padding-left": `${Math.max(0, props.heading.level - 1) * 12}px` }}
         type="button"
       >
-        <span class={`mr-2 inline-flex rounded px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wider ${
+        <span class={`mr-1.5 inline-flex rounded px-1 py-0 text-[9px] font-semibold uppercase ${
           props.heading.level === 1 
             ? "bg-blue-500/20 text-blue-400" 
             : props.heading.level === 2
@@ -96,10 +96,10 @@ function PreviewHeadingRow(props: PreviewHeadingRowProps) {
         }`}>
           H{props.heading.level}
         </span>
-        <span class="truncate text-sm text-neutral-300">{props.heading.text}</span>
+        <span class="truncate text-xs text-neutral-300">{props.heading.text}</span>
       </button>
       <button
-        class="rounded p-1.5 text-neutral-600 transition hover:bg-rose-500/20 hover:text-rose-400 disabled:opacity-40"
+        class="rounded p-1 text-neutral-600 transition hover:bg-rose-500/20 hover:text-rose-400 disabled:opacity-40"
         disabled={props.isBusy}
         onClick={(event) => {
           event.stopPropagation();
@@ -107,7 +107,7 @@ function PreviewHeadingRow(props: PreviewHeadingRowProps) {
         }}
         type="button"
       >
-        <svg class="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <svg class="h-3 w-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
           <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
         </svg>
       </button>
@@ -131,12 +131,12 @@ export default function CaptureTargetPanel(props: CaptureTargetPanelProps) {
   };
 
   return (
-    <div class="flex h-full min-h-0 flex-col gap-4">
-      <div class="flex flex-wrap items-center gap-3">
-        <label class="text-xs font-medium uppercase tracking-[0.1em] text-neutral-500">Insert Into</label>
-        <div class="flex flex-1 items-center gap-3">
+    <div class="flex h-full min-h-0 flex-col">
+      <div class="flex items-center gap-2 border-b border-neutral-800/50 bg-neutral-900/30 px-3 py-2">
+        <label class="text-[10px] font-medium uppercase tracking-wider text-neutral-500">Insert Into</label>
+        <div class="flex flex-1 items-center gap-2">
           <select
-            class="vercel-select flex-1"
+            class="h-7 flex-1 rounded border border-neutral-700 bg-neutral-950 px-2 text-xs text-neutral-200 outline-none transition hover:border-neutral-600 focus:border-blue-500"
             disabled={!props.captureRootPath() || props.isLoadingCaptureTargets()}
             onChange={(event) => props.setSelectedCaptureTarget(event.currentTarget.value)}
             value={props.selectedCaptureTarget()}
@@ -153,24 +153,24 @@ export default function CaptureTargetPanel(props: CaptureTargetPanelProps) {
             </For>
           </select>
           <button
-            class="vercel-btn vercel-btn-ghost h-9 w-9 p-0"
+            class="inline-flex h-7 w-7 items-center justify-center rounded border border-neutral-700 bg-neutral-800 text-neutral-300 transition hover:border-neutral-600 hover:bg-neutral-700 hover:text-white disabled:opacity-50"
             disabled={!props.captureRootPath()}
             onClick={() => void props.createCaptureTarget()}
             title="Create new target"
             type="button"
           >
-            <svg class="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <svg class="h-3.5 w-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4" />
             </svg>
           </button>
           <button
-            class="vercel-btn vercel-btn-ghost h-9 w-9 p-0"
+            class="inline-flex h-7 w-7 items-center justify-center rounded border border-neutral-700 bg-neutral-800 text-neutral-300 transition hover:border-neutral-600 hover:bg-neutral-700 hover:text-white disabled:opacity-50"
             disabled={!props.captureRootPath()}
             onClick={() => void props.selectCaptureTargetFromFilesystem()}
             title="Browse for target"
             type="button"
           >
-            <svg class="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <svg class="h-3.5 w-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" />
             </svg>
           </button>
@@ -178,28 +178,28 @@ export default function CaptureTargetPanel(props: CaptureTargetPanelProps) {
       </div>
 
       <Show when={props.isAllRootsSelected()}>
-        <div class="flex items-center gap-2 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-sm text-amber-400">
-          <svg class="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <div class="flex items-center gap-2 border-b border-amber-500/20 bg-amber-500/5 px-3 py-2 text-xs text-amber-400">
+          <svg class="h-3.5 w-3.5 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
           </svg>
-          Select an individual root to manage destination files.
+          <span class="text-[10px]">Select an individual root to manage destination files</span>
         </div>
       </Show>
 
-      <div class="flex min-h-0 flex-1 flex-col rounded-xl border border-neutral-800 bg-neutral-950/50 p-4">
-        <div class="flex items-start justify-between gap-3">
+      <div class="flex min-h-0 flex-1 flex-col p-3">
+        <div class="flex items-start justify-between gap-2">
           <div class="min-w-0 flex-1">
-            <p class="text-[11px] uppercase tracking-[0.08em] text-neutral-500">Current target</p>
+            <p class="text-[10px] uppercase tracking-wider text-neutral-500">Current target</p>
             <Show
               when={selectedTargetInfo()}
-              fallback={<p class="mt-1 truncate text-sm text-neutral-500">No target selected</p>}
+              fallback={<p class="mt-0.5 truncate text-xs text-neutral-500">No target selected</p>}
             >
               {(info) => (
                 <>
-                  <p class="mt-1 truncate text-sm font-medium text-neutral-200" title={info().absolutePath}>
+                  <p class="mt-0.5 truncate text-xs font-medium text-neutral-200" title={info().absolutePath}>
                     {info().fileName}
                   </p>
-                  <p class="truncate text-xs text-neutral-600" title={info().absolutePath}>
+                  <p class="truncate text-[10px] text-neutral-600" title={info().absolutePath}>
                     {info().parentPath}
                   </p>
                 </>
@@ -207,11 +207,10 @@ export default function CaptureTargetPanel(props: CaptureTargetPanelProps) {
             </Show>
           </div>
 
-          <span class="vercel-badge shrink-0">
+          <span class="inline-flex shrink-0 items-center rounded-full border border-neutral-700 bg-neutral-800 px-2 py-0.5 text-[10px] text-neutral-300">
             {props.isLoadingCapturePreview() ? (
-              <span class="flex items-center gap-1.5">
-                <div class="h-3 w-3 animate-spin rounded-full border border-neutral-600 border-t-blue-500" />
-                Loading...
+              <span class="flex items-center gap-1">
+                <div class="h-2.5 w-2.5 animate-spin rounded-full border border-neutral-600 border-t-blue-500" />
               </span>
             ) : (
               `${props.captureTargetPreview()?.headingCount ?? 0} headings`
@@ -221,12 +220,12 @@ export default function CaptureTargetPanel(props: CaptureTargetPanelProps) {
 
         <Show when={selectedHeading()}>
           {(heading) => (
-            <div class="mt-4 flex items-center justify-between gap-4 rounded-lg border border-emerald-500/30 bg-emerald-500/10 px-3 py-2">
-              <span class="truncate text-sm text-emerald-300">
-                Context: H{heading().level} - {heading().text}
+            <div class="mt-2 flex items-center justify-between gap-2 rounded border border-emerald-500/30 bg-emerald-500/10 px-2 py-1.5">
+              <span class="truncate text-xs text-emerald-300">
+                H{heading().level}: {heading().text}
               </span>
               <button
-                class="vercel-btn vercel-btn-ghost h-7 px-2 py-0 text-xs"
+                class="rounded px-1.5 py-0.5 text-[10px] text-neutral-400 transition hover:bg-neutral-800 hover:text-neutral-200"
                 onClick={() => props.setSelectedCaptureHeadingOrder(null)}
                 type="button"
               >
@@ -236,16 +235,15 @@ export default function CaptureTargetPanel(props: CaptureTargetPanelProps) {
           )}
         </Show>
 
-        <div class="mt-4 min-h-0 flex-1 overflow-auto pr-1">
+        <div class="mt-2 min-h-0 flex-1 overflow-auto">
           <Show
             when={props.captureTargetH1ToH4().length > 0}
             fallback={
-              <div class="flex flex-col items-center justify-center py-6 text-center">
-                <svg class="mb-2 h-8 w-8 text-neutral-700" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <div class="flex flex-col items-center justify-center py-4 text-center">
+                <svg class="mb-1.5 h-6 w-6 text-neutral-700" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                   <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
                 </svg>
-                <p class="text-sm text-neutral-500">No headings yet</p>
-                <p class="text-xs text-neutral-600">Add content to see headings here.</p>
+                <p class="text-xs text-neutral-500">No headings yet</p>
               </div>
             }
           >
@@ -258,7 +256,7 @@ export default function CaptureTargetPanel(props: CaptureTargetPanelProps) {
                 void props.moveCaptureHeading(sourceOrder, targetOrder);
               }}
             >
-              <div class="space-y-2">
+              <div class="space-y-1">
                 <For each={props.captureTargetH1ToH4()}>
                   {(heading) => (
                     <PreviewHeadingRow
@@ -275,8 +273,8 @@ export default function CaptureTargetPanel(props: CaptureTargetPanelProps) {
           </Show>
         </div>
         
-        <p class="mt-4 text-xs text-neutral-600">
-          Click to set insert context. Drag to reorder.
+        <p class="mt-2 text-[10px] text-neutral-600">
+          Click to set context · Drag to reorder
         </p>
       </div>
     </div>

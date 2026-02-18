@@ -49,6 +49,8 @@ function App() {
 
   const [searchQuery, setSearchQuery] = createSignal("");
   const [searchResults, setSearchResults] = createSignal<SearchHit[]>([]);
+  const [searchFileNamesOnly, setSearchFileNamesOnly] = createSignal(false);
+  const [searchSemanticEnabled, setSearchSemanticEnabled] = createSignal(true);
 
   const [focusedNodeKey, setFocusedNodeKey] = createSignal("");
   const [sidePreview, setSidePreview] = createSignal<SidePreview | null>(null);
@@ -70,6 +72,11 @@ function App() {
   const [treeScrollTop, setTreeScrollTop] = createSignal(0);
   const [treeViewportHeight, setTreeViewportHeight] = createSignal(0);
   const [leftRailWidthPx, setLeftRailWidthPx] = createSignal(LEFT_RAIL_DEFAULT_PX);
+  const [showCapturePanel, setShowCapturePanel] = createSignal(true);
+  const [showPreviewPanel, setShowPreviewPanel] = createSignal(true);
+  const [previewPanelWidthPx, setPreviewPanelWidthPx] = createSignal(420);
+  const PREVIEW_PANEL_MIN_PX = 280;
+  const PREVIEW_PANEL_MAX_PX = 640;
 
   let treeRef: HTMLDivElement | undefined;
   let searchRequestSeq = 0;
@@ -304,6 +311,20 @@ function App() {
     searchInputRef?.select();
   };
 
+  const toggleFileNameSearchMode = () => {
+    const next = !searchFileNamesOnly();
+    setSearchFileNamesOnly(next);
+    setStatus(next ? "Filename-only search enabled (press F again to exit)." : "Hybrid search restored.");
+    focusSearchField();
+  };
+
+  const toggleSemanticSearchMode = () => {
+    const next = !searchSemanticEnabled();
+    setSearchSemanticEnabled(next);
+    setStatus(next ? "AI semantic search enabled." : "AI semantic search disabled (lexical only).");
+    focusSearchField();
+  };
+
   const targetIsTextEditable = (target: EventTarget | null) => {
     if (!(target instanceof HTMLElement)) return false;
     if (target.isContentEditable) return true;
@@ -373,6 +394,8 @@ function App() {
     }, 90);
   };
 
+  let stopPreviewPanelResize: (() => void) | null = null;
+
   const startLeftRailResize = (event: MouseEvent) => {
     if (window.innerWidth < 1024) return;
     event.preventDefault();
@@ -403,6 +426,39 @@ function App() {
     document.body.classList.add("is-resizing-panels");
     stopLeftRailResize = onMouseUp;
   };
+
+  const startPreviewPanelResize = (event: MouseEvent) => {
+    event.preventDefault();
+
+    const startX = event.clientX;
+    const initialWidth = previewPanelWidthPx();
+
+    const onMouseMove = (moveEvent: MouseEvent) => {
+      const delta = startX - moveEvent.clientX;
+      const nextWidth = Math.min(
+        PREVIEW_PANEL_MAX_PX,
+        Math.max(PREVIEW_PANEL_MIN_PX, initialWidth + delta),
+      );
+      setPreviewPanelWidthPx(nextWidth);
+    };
+
+    const onMouseUp = () => {
+      window.removeEventListener("mousemove", onMouseMove);
+      window.removeEventListener("mouseup", onMouseUp);
+      window.removeEventListener("blur", onMouseUp);
+      document.body.classList.remove("is-resizing-panels");
+      stopPreviewPanelResize = null;
+    };
+
+    window.addEventListener("mousemove", onMouseMove);
+    window.addEventListener("mouseup", onMouseUp);
+    window.addEventListener("blur", onMouseUp);
+    document.body.classList.add("is-resizing-panels");
+    stopPreviewPanelResize = onMouseUp;
+  };
+
+  const toggleCapturePanel = () => setShowCapturePanel(prev => !prev);
+  const togglePreviewPanel = () => setShowPreviewPanel(prev => !prev);
 
   const loadRoots = async () => {
     const loaded = await invokeTyped<RootSummary[]>("list_roots");
@@ -838,6 +894,7 @@ function App() {
     buildTreeRows({
       snapshotIndex: snapshotIndex(),
       searchMode: searchMode(),
+      searchFileNamesOnly: searchFileNamesOnly(),
       searchResults: searchResults(),
       previewCache: previewCache(),
       expandedFolders: expandedFolders(),
@@ -1175,32 +1232,51 @@ function App() {
     const rootPath = selectedRootPath();
     const searchRootPath = rootPath === ALL_ROOTS_KEY ? undefined : rootPath;
     const query = searchQuery().trim();
+    const fileNameOnly = searchFileNamesOnly();
+    const semanticEnabled = searchSemanticEnabled();
     if ((!rootPath && roots().length === 0) || query.length < 2) {
       setSearchResults([]);
       setIsSearching(false);
       return;
     }
 
+    const debounceMs = query.length > 120 ? 240 : query.length > 42 ? 170 : 120;
     setIsSearching(true);
     const requestId = ++searchRequestSeq;
     const timer = setTimeout(() => {
-      void invokeTyped<SearchHit[]>("search_index", {
+      const invocation = invokeTyped<SearchHit[]>("search_index_hybrid", {
         query,
         rootPath: searchRootPath,
         limit: 120,
+        fileNameOnly,
+        semanticEnabled,
       })
+        .catch((error) => {
+          if (requestId === searchRequestSeq) {
+            setStatus(`Search failed: ${String(error)}`);
+          }
+          return [] as SearchHit[];
+        })
         .then((results) => {
           if (requestId === searchRequestSeq) {
             setSearchResults(results);
           }
         })
-        .catch((error) => setStatus(`Search failed: ${String(error)}`))
         .finally(() => {
           if (requestId === searchRequestSeq) {
             setIsSearching(false);
           }
         });
-    }, 150);
+
+      const timeout = setTimeout(() => {
+        if (requestId === searchRequestSeq) {
+          setIsSearching(false);
+        }
+      }, 1500);
+      void invocation.finally(() => {
+        clearTimeout(timeout);
+      });
+    }, debounceMs);
 
     onCleanup(() => clearTimeout(timer));
   });
@@ -1268,6 +1344,27 @@ function App() {
         return;
       }
 
+      if (!event.metaKey && !event.ctrlKey && !event.altKey && key.toLowerCase() === "f") {
+        if (targetIsTextEditable(event.target)) return;
+        event.preventDefault();
+        toggleFileNameSearchMode();
+        return;
+      }
+
+      if (!event.metaKey && !event.ctrlKey && !event.altKey && key.toLowerCase() === "i") {
+        if (targetIsTextEditable(event.target)) return;
+        event.preventDefault();
+        toggleCapturePanel();
+        return;
+      }
+
+      if (!event.metaKey && !event.ctrlKey && !event.altKey && key.toLowerCase() === "p") {
+        if (targetIsTextEditable(event.target)) return;
+        event.preventDefault();
+        togglePreviewPanel();
+        return;
+      }
+
       if (!event.metaKey && !event.ctrlKey && !event.altKey && (key === "ArrowDown" || key === "ArrowUp")) {
         if (event.defaultPrevented) return;
         if (targetIsTextEditable(event.target)) return;
@@ -1305,6 +1402,7 @@ function App() {
       stopIndexProgressListener?.();
       stopIndexProgressListener = null;
       stopLeftRailResize?.();
+      stopPreviewPanelResize?.();
       window.removeEventListener("resize", onResize);
       window.removeEventListener("keydown", onGlobalKeyDown, true);
       if (headingPreviewTimer) {
@@ -1334,103 +1432,105 @@ function App() {
   };
 
   return (
-    <div class="h-screen bg-[#0a0a0a]">
-      <div class="flex h-full w-full flex-col px-6 py-5">
-        <header class="mb-6">
-          <div class="flex items-center gap-3">
-            <div class="flex h-10 w-10 items-center justify-center rounded-xl bg-gradient-to-br from-blue-500 to-emerald-500 shadow-lg shadow-blue-500/20">
-              <svg class="h-5 w-5 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" />
-              </svg>
-            </div>
-            <div>
-              <h1 class="text-xl font-semibold tracking-tight text-white">BlockFile</h1>
-              <p class="text-sm text-neutral-500">Document indexer and capture tool</p>
-            </div>
-          </div>
-        </header>
+    <div class="h-screen bg-[#0a0a0a] overflow-hidden">
+      <div class="flex h-full w-full flex-col">
+        <TopControls
+          activeLastIndexedMs={activeLastIndexedMs}
+          activeRootLabel={activeRootLabel}
+          addFolder={addFolder}
+          copyToast={copyToast}
+          isIndexing={isIndexing}
+          isSearching={isSearching}
+          roots={roots}
+          runIndexForSelection={runIndexForSelection}
+          searchQuery={searchQuery}
+          searchFileNamesOnly={searchFileNamesOnly}
+          searchSemanticEnabled={searchSemanticEnabled}
+          selectedRootPath={selectedRootPath}
+          indexProgress={indexProgress}
+          setSearchInputRef={setSearchInputElement}
+          setSearchQuery={setSearchQuery}
+          setSelectedRootPath={setSelectedRootPath}
+          toggleSemanticSearchMode={toggleSemanticSearchMode}
+          status={status}
+          showCapturePanel={showCapturePanel}
+          showPreviewPanel={showPreviewPanel}
+          toggleCapturePanel={toggleCapturePanel}
+          togglePreviewPanel={togglePreviewPanel}
+        />
 
-        <main class="vercel-card flex min-h-0 flex-1 flex-col overflow-hidden">
-          <TopControls
-            activeLastIndexedMs={activeLastIndexedMs}
-            activeRootLabel={activeRootLabel}
-            addFolder={addFolder}
-            copyToast={copyToast}
-            isIndexing={isIndexing}
-            isSearching={isSearching}
-            roots={roots}
-            runIndexForSelection={runIndexForSelection}
-            searchQuery={searchQuery}
-            selectedRootPath={selectedRootPath}
-            indexProgress={indexProgress}
-            setSearchInputRef={setSearchInputElement}
-            setSearchQuery={setSearchQuery}
-            setSelectedRootPath={setSelectedRootPath}
-            status={status}
-          />
-
-          <div class="vercel-divider my-5" />
-
-          <div class="grid min-h-0 flex-1 gap-5 xl:grid-cols-[minmax(0,1fr)_420px]">
-            <section class="vercel-card min-h-0 border-0 bg-neutral-950/50 p-4">
-              <div class="workspace-split h-full min-h-0" style={{ "--left-rail-width": `${leftRailWidthPx()}px` }}>
-                <aside class="vercel-card min-h-0 border-neutral-800/70 bg-neutral-950/60 p-4">
-                  <CaptureTargetPanel
-                    captureRootPath={captureRootPath}
-                    captureTargetH1ToH4={captureTargetH1ToH4}
-                    captureTargetPreview={captureTargetPreview}
-                    captureTargets={captureTargets}
-                    createCaptureTarget={createCaptureTarget}
-                    deleteCaptureHeading={deleteCaptureHeading}
-                    isAllRootsSelected={isAllRootsSelected}
-                    isLoadingCapturePreview={isLoadingCapturePreview}
-                    isLoadingCaptureTargets={isLoadingCaptureTargets}
-                    moveCaptureHeading={moveCaptureHeading}
-                    selectCaptureTargetFromFilesystem={selectCaptureTargetFromFilesystem}
-                    selectedCaptureHeadingOrder={selectedCaptureHeadingOrder}
-                    selectedCaptureTarget={selectedCaptureTarget}
-                    selectedCaptureTargetMeta={selectedCaptureTargetMeta}
-                    setSelectedCaptureHeadingOrder={setSelectedCaptureHeadingOrder}
-                    setSelectedCaptureTarget={setCaptureTargetSelection}
-                  />
-                </aside>
-
-                <button
-                  aria-label="Resize insert preview panel"
-                  class="panel-resize-handle hidden lg:flex"
-                  onMouseDown={startLeftRailResize}
-                  title="Drag to resize"
-                  type="button"
+        <div class="flex min-h-0 flex-1">
+          <div class="workspace-split h-full min-h-0 flex-1" style={{ "--left-rail-width": showCapturePanel() ? `${leftRailWidthPx()}px` : '0px' }}>
+            {showCapturePanel() && (
+              <aside class="h-full min-h-0 border-r border-neutral-800/50 bg-neutral-950/30 flex flex-col">
+                <CaptureTargetPanel
+                  captureRootPath={captureRootPath}
+                  captureTargetH1ToH4={captureTargetH1ToH4}
+                  captureTargetPreview={captureTargetPreview}
+                  captureTargets={captureTargets}
+                  createCaptureTarget={createCaptureTarget}
+                  deleteCaptureHeading={deleteCaptureHeading}
+                  isAllRootsSelected={isAllRootsSelected}
+                  isLoadingCapturePreview={isLoadingCapturePreview}
+                  isLoadingCaptureTargets={isLoadingCaptureTargets}
+                  moveCaptureHeading={moveCaptureHeading}
+                  selectCaptureTargetFromFilesystem={selectCaptureTargetFromFilesystem}
+                  selectedCaptureHeadingOrder={selectedCaptureHeadingOrder}
+                  selectedCaptureTarget={selectedCaptureTarget}
+                  selectedCaptureTargetMeta={selectedCaptureTargetMeta}
+                  setSelectedCaptureHeadingOrder={setSelectedCaptureHeadingOrder}
+                  setSelectedCaptureTarget={setCaptureTargetSelection}
                 />
+              </aside>
+            )}
 
-                <div class="vercel-card min-h-0 border-neutral-800/70 bg-neutral-950/30">
-                  <TreeView
-                    activateRow={activateRow}
-                    applyPreviewFromRow={applyPreviewFromRow}
-                    collapsedHeadings={collapsedHeadings}
-                    expandedFiles={expandedFiles}
-                    expandedFolders={expandedFolders}
-                    focusedNodeKey={focusedNodeKey}
-                    isLoadingSnapshot={isLoadingSnapshot}
-                    isSearching={isSearching}
-                    onTreeKeyDown={onTreeKeyDown}
-                    onTreeScroll={setTreeScrollTop}
-                    openSearchResult={openSearchResult}
-                    searchMode={searchMode}
-                    selectedRootPath={selectedRootPath}
-                    setFocusedNodeKey={setFocusedNodeKey}
-                    setTreeRef={setTreeElement}
-                    treeRowsLength={() => treeRows().length}
-                    virtualWindow={virtualWindow}
-                    visibleTreeRows={visibleTreeRows}
-                  />
-                </div>
-              </div>
-            </section>
+            {showCapturePanel() && (
+              <button
+                aria-label="Resize insert preview panel"
+                class="panel-resize-handle hidden lg:flex"
+                onMouseDown={startLeftRailResize}
+                title="Drag to resize"
+                type="button"
+              />
+            )}
 
-            <SidePreviewPane sidePreview={sidePreview} />
+            <div class="h-full min-h-0 flex-1 bg-neutral-950/20">
+              <TreeView
+                activateRow={activateRow}
+                applyPreviewFromRow={applyPreviewFromRow}
+                collapsedHeadings={collapsedHeadings}
+                expandedFiles={expandedFiles}
+                expandedFolders={expandedFolders}
+                focusedNodeKey={focusedNodeKey}
+                isLoadingSnapshot={isLoadingSnapshot}
+                isSearching={isSearching}
+                onTreeKeyDown={onTreeKeyDown}
+                onTreeScroll={setTreeScrollTop}
+                openSearchResult={openSearchResult}
+                searchMode={searchMode}
+                selectedRootPath={selectedRootPath}
+                setFocusedNodeKey={setFocusedNodeKey}
+                setTreeRef={setTreeElement}
+                treeRowsLength={() => treeRows().length}
+                virtualWindow={virtualWindow}
+                visibleTreeRows={visibleTreeRows}
+              />
+            </div>
           </div>
-        </main>
+
+          {showPreviewPanel() && (
+            <>
+              <button
+                aria-label="Resize preview panel"
+                class="panel-resize-handle hidden lg:flex"
+                onMouseDown={startPreviewPanelResize}
+                title="Drag to resize preview"
+                type="button"
+              />
+              <SidePreviewPane sidePreview={sidePreview} width={previewPanelWidthPx} />
+            </>
+          )}
+        </div>
       </div>
     </div>
   );

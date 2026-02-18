@@ -55,6 +55,7 @@ export type FilePreview = {
 };
 
 export type SearchHit = {
+  source: "lexical" | "semantic" | "hybrid";
   kind: "heading" | "file" | "author";
   fileId: number;
   fileName: string;

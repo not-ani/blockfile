@@ -1,4 +1,4 @@
-export const TREE_ROW_STRIDE_PX = 48;
+export const TREE_ROW_STRIDE_PX = 36;
 export const TREE_OVERSCAN_ROWS = 14;
 export const ALL_ROOTS_KEY = "__all__";
 
