@@ -101,6 +101,8 @@ export type TreeRow = {
   fileId?: number;
   copyText?: string;
   sourcePath?: string;
+  richHtml?: string;
+  paragraphXml?: string[];
   searchResult?: SearchHit;
   hasChildren?: boolean;
 };

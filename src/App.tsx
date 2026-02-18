@@ -7,6 +7,9 @@ import SidePreviewPane from "./components/SidePreviewPane.tsx";
 import TopControls from "./components/TopControls.tsx";
 import TreeView from "./components/TreeView.tsx";
 import { ALL_ROOTS_KEY, TREE_OVERSCAN_ROWS, TREE_ROW_STRIDE_PX } from "./lib/constants";
+import { isAbortError, searchDebatifyTags } from "./lib/remoteSearch/client";
+import { DEBATIFY_REMOTE_FOLDER_PATH } from "./lib/remoteSearch/treeRows";
+import type { DebatifyTagHit } from "./lib/remoteSearch/types";
 import type {
   CaptureInsertResult,
   CaptureTarget,
@@ -39,20 +42,48 @@ function App() {
   const TREE_PANEL_MIN_PX = 360;
   const PANEL_HANDLE_WIDTH_PX = 12;
   const CAPTURE_TARGET_PREFS_KEY = "blockfile.captureTargetsByRoot.v1";
+  const SEARCH_FILENAME_ONLY_PREFS_KEY = "blockfile.searchFileNamesOnly.v1";
+  const SEARCH_DEBATIFY_ENABLED_PREFS_KEY = "blockfile.searchDebatifyEnabled.v1";
+  const defaultExpandedFolders = () => new Set(["", DEBATIFY_REMOTE_FOLDER_PATH]);
+
+  const loadStoredBoolean = (key: string, fallback: boolean) => {
+    try {
+      const raw = localStorage.getItem(key);
+      if (raw === "true") return true;
+      if (raw === "false") return false;
+    } catch {
+      // Ignore storage read failures (e.g. restricted storage mode)
+    }
+    return fallback;
+  };
+
+  const persistBooleanSetting = (key: string, value: boolean) => {
+    try {
+      localStorage.setItem(key, value ? "true" : "false");
+    } catch {
+      // Ignore storage write failures (e.g. restricted storage mode)
+    }
+  };
 
   const [roots, setRoots] = createSignal<RootSummary[]>([]);
   const [selectedRootPath, setSelectedRootPath] = createSignal("");
   const [snapshot, setSnapshot] = createSignal<IndexSnapshot | null>(null);
   const [allRootSnapshots, setAllRootSnapshots] = createSignal<IndexSnapshot[]>([]);
-  const [previewCache, setPreviewCache] = createSignal<Record<number, FilePreview>>({});
-  const [expandedFolders, setExpandedFolders] = createSignal<Set<string>>(new Set([""]));
+  const [previewCacheRenderTick, setPreviewCacheRenderTick] = createSignal(0);
+  const [expandedFolders, setExpandedFolders] = createSignal<Set<string>>(defaultExpandedFolders());
   const [expandedFiles, setExpandedFiles] = createSignal<Set<number>>(new Set());
   const [collapsedHeadings, setCollapsedHeadings] = createSignal<Set<string>>(new Set());
 
   const [searchQuery, setSearchQuery] = createSignal("");
   const [searchResults, setSearchResults] = createSignal<SearchHit[]>([]);
-  const [searchFileNamesOnly, setSearchFileNamesOnly] = createSignal(false);
+  const [remoteTagResults, setRemoteTagResults] = createSignal<DebatifyTagHit[]>([]);
+  const [searchFileNamesOnly, setSearchFileNamesOnly] = createSignal(
+    loadStoredBoolean(SEARCH_FILENAME_ONLY_PREFS_KEY, false),
+  );
   const [searchSemanticEnabled, setSearchSemanticEnabled] = createSignal(true);
+  const [searchDebatifyEnabled, setSearchDebatifyEnabled] = createSignal(
+    loadStoredBoolean(SEARCH_DEBATIFY_ENABLED_PREFS_KEY, true),
+  );
 
   const [focusedNodeKey, setFocusedNodeKey] = createSignal("");
   const [sidePreview, setSidePreview] = createSignal<SidePreview | null>(null);
@@ -66,7 +97,8 @@ function App() {
   const [isLoadingCapturePreview, setIsLoadingCapturePreview] = createSignal(false);
 
   const [isIndexing, setIsIndexing] = createSignal(false);
-  const [isSearching, setIsSearching] = createSignal(false);
+  const [isSearchingLocal, setIsSearchingLocal] = createSignal(false);
+  const [isSearchingRemote, setIsSearchingRemote] = createSignal(false);
   const [isLoadingSnapshot, setIsLoadingSnapshot] = createSignal(false);
   const [status, setStatus] = createSignal("Ready");
   const [indexProgress, setIndexProgress] = createSignal<IndexProgress | null>(null);
@@ -86,9 +118,12 @@ function App() {
 
   let treeRef: HTMLDivElement | undefined;
   let searchRequestSeq = 0;
+  let remoteSearchRequestSeq = 0;
   let previewWarmupSeq = 0;
   let headingPreviewSeq = 0;
   let focusScrollFrame = 0;
+  let treeScrollFrame = 0;
+  let pendingTreeScrollTopValue = 0;
   let captureTargetsSeq = 0;
   let capturePreviewSeq = 0;
   let stopLeftRailResize: (() => void) | null = null;
@@ -98,6 +133,7 @@ function App() {
   let previewCacheFlushTimer = 0;
   let pendingFocusDelta = 0;
   let focusMoveFrame = 0;
+  const previewCacheByFileId = new Map<number, FilePreview>();
   const previewLoadsInFlight = new Map<number, Promise<FilePreview>>();
   const pendingPreviewCacheUpdates = new Map<number, FilePreview>();
 
@@ -108,7 +144,52 @@ function App() {
   );
   const captureRootPath = createMemo(() => (isAllRootsSelected() ? "" : selectedRootPath()));
   const searchMode = createMemo(() => searchQuery().trim().length >= 2);
+  const isSearching = createMemo(() => isSearchingLocal() || isSearchingRemote());
+  const activeTreePreviewFileIds = createMemo(() => {
+    const ids = new Set<number>();
+
+    if (searchMode()) {
+      for (const result of searchResults()) {
+        if (searchFileNamesOnly() || result.kind === "heading") {
+          ids.add(result.fileId);
+        }
+      }
+      return ids;
+    }
+
+    for (const fileId of expandedFiles()) {
+      ids.add(fileId);
+    }
+    return ids;
+  });
+  const previewCacheForTree = createMemo<Record<number, FilePreview>>(() => {
+    previewCacheRenderTick();
+    const ids = activeTreePreviewFileIds();
+    if (ids.size === 0) return {};
+
+    const subset: Record<number, FilePreview> = {};
+    for (const fileId of ids) {
+      const preview = previewCacheByFileId.get(fileId);
+      if (preview) {
+        subset[fileId] = preview;
+      }
+    }
+    return subset;
+  });
   const normalizeCaptureTargetPath = (value: string) => normalizeSlashes(value).trim();
+
+  const resetPreviewCacheState = () => {
+    previewCacheByFileId.clear();
+    previewLoadsInFlight.clear();
+    pendingPreviewCacheUpdates.clear();
+
+    if (previewCacheFlushTimer) {
+      window.clearTimeout(previewCacheFlushTimer);
+      previewCacheFlushTimer = 0;
+    }
+
+    setPreviewCacheRenderTick((tick) => tick + 1);
+  };
 
   const loadCaptureTargetPrefs = () => {
     try {
@@ -228,18 +309,22 @@ function App() {
 
     const updates = Array.from(pendingPreviewCacheUpdates.entries());
     pendingPreviewCacheUpdates.clear();
-    startTransition(() => {
-      setPreviewCache((current) => {
-        let changed = false;
-        const next = { ...current };
-        for (const [fileId, preview] of updates) {
-          if (next[fileId] !== preview) {
-            next[fileId] = preview;
-            changed = true;
-          }
+
+    const activePreviewIds = untrack(activeTreePreviewFileIds);
+    let shouldRender = false;
+    for (const [fileId, preview] of updates) {
+      if (previewCacheByFileId.get(fileId) !== preview) {
+        previewCacheByFileId.set(fileId, preview);
+        if (activePreviewIds.has(fileId)) {
+          shouldRender = true;
         }
-        return changed ? next : current;
-      });
+      }
+    }
+
+    if (!shouldRender) return;
+
+    startTransition(() => {
+      setPreviewCacheRenderTick((tick) => tick + 1);
     });
   };
 
@@ -250,7 +335,7 @@ function App() {
   };
 
   const ensurePreviewLoaded = async (fileId: number) => {
-    const cached = untrack(() => previewCache()[fileId]);
+    const cached = previewCacheByFileId.get(fileId);
     if (cached) return cached;
 
     const inFlight = previewLoadsInFlight.get(fileId);
@@ -323,6 +408,18 @@ function App() {
     setTreeScrollTop(treeRef.scrollTop);
   };
 
+  const scheduleTreeScrollTop = (nextScrollTop: number) => {
+    pendingTreeScrollTopValue = nextScrollTop;
+    if (treeScrollFrame) return;
+
+    treeScrollFrame = requestAnimationFrame(() => {
+      treeScrollFrame = 0;
+      setTreeScrollTop((current) =>
+        current === pendingTreeScrollTopValue ? current : pendingTreeScrollTopValue,
+      );
+    });
+  };
+
   const keepFocusedRowInView = () => {
     if (!treeRef) return;
     const key = focusedNodeKey();
@@ -369,6 +466,13 @@ function App() {
     const next = !searchSemanticEnabled();
     setSearchSemanticEnabled(next);
     setStatus(next ? "AI semantic search enabled." : "AI semantic search disabled (lexical only).");
+    focusSearchField();
+  };
+
+  const toggleDebatifySearchMode = () => {
+    const next = !searchDebatifyEnabled();
+    setSearchDebatifyEnabled(next);
+    setStatus(next ? "Debatify API search enabled (press D to toggle)." : "Debatify API search disabled.");
     focusSearchField();
   };
 
@@ -574,6 +678,7 @@ function App() {
         setSelectedRootPath("");
         setSnapshot(null);
         setAllRootSnapshots([]);
+        resetPreviewCacheState();
       }
     });
   };
@@ -587,10 +692,10 @@ function App() {
       batch(() => {
         setSnapshot(nextSnapshot);
         setAllRootSnapshots([]);
-        setExpandedFolders(new Set([""]));
+        setExpandedFolders(defaultExpandedFolders());
         setExpandedFiles(new Set<number>());
         setCollapsedHeadings(new Set<string>());
-        setPreviewCache({});
+        resetPreviewCacheState();
         setCaptureByRowKey({});
         setFocusedNodeKey("folder:__root__");
         setTreeScrollTop(0);
@@ -634,10 +739,10 @@ function App() {
       batch(() => {
         setAllRootSnapshots(snapshots);
         setSnapshot(null);
-        setExpandedFolders(new Set([""]));
+        setExpandedFolders(defaultExpandedFolders());
         setExpandedFiles(new Set<number>());
         setCollapsedHeadings(new Set<string>());
-        setPreviewCache({});
+        resetPreviewCacheState();
         setCaptureByRowKey({});
         setFocusedNodeKey("folder:__root__");
         setTreeScrollTop(0);
@@ -1031,18 +1136,94 @@ function App() {
 
   const snapshotIndex = createMemo(() => buildSnapshotIndex(activeSnapshot()));
 
-  const treeRows = createMemo<TreeRow[]>(() =>
-    buildTreeRows({
+  const sameSearchResult = (left: SearchHit | undefined, right: SearchHit | undefined) => {
+    if (left === right) return true;
+    if (!left || !right) return false;
+
+    return (
+      left.source === right.source &&
+      left.kind === right.kind &&
+      left.fileId === right.fileId &&
+      left.fileName === right.fileName &&
+      left.relativePath === right.relativePath &&
+      left.absolutePath === right.absolutePath &&
+      left.headingLevel === right.headingLevel &&
+      left.headingText === right.headingText &&
+      left.headingOrder === right.headingOrder &&
+      left.score === right.score
+    );
+  };
+
+  const sameParagraphXml = (left: string[] | undefined, right: string[] | undefined) => {
+    if (left === right) return true;
+    if (!left || !right || left.length !== right.length) return false;
+    for (let index = 0; index < left.length; index += 1) {
+      if (left[index] !== right[index]) return false;
+    }
+    return true;
+  };
+
+  const sameTreeRow = (left: TreeRow, right: TreeRow) => {
+    if (left === right) return true;
+    return (
+      left.key === right.key &&
+      left.kind === right.kind &&
+      left.depth === right.depth &&
+      left.label === right.label &&
+      left.subLabel === right.subLabel &&
+      left.headingLevel === right.headingLevel &&
+      left.headingOrder === right.headingOrder &&
+      left.folderPath === right.folderPath &&
+      left.fileId === right.fileId &&
+      left.copyText === right.copyText &&
+      left.sourcePath === right.sourcePath &&
+      left.richHtml === right.richHtml &&
+      left.hasChildren === right.hasChildren &&
+      sameParagraphXml(left.paragraphXml, right.paragraphXml) &&
+      sameSearchResult(left.searchResult, right.searchResult)
+    );
+  };
+
+  const reconcileTreeRows = (previousRows: TreeRow[], nextRows: TreeRow[]) => {
+    if (previousRows.length === 0 || nextRows.length === 0) return nextRows;
+
+    const previousByKey = new Map<string, TreeRow>();
+    for (const previousRow of previousRows) {
+      previousByKey.set(previousRow.key, previousRow);
+    }
+
+    let reusedCount = 0;
+    const reconciled = nextRows.map((nextRow) => {
+      const previousRow = previousByKey.get(nextRow.key);
+      if (previousRow && sameTreeRow(previousRow, nextRow)) {
+        reusedCount += 1;
+        return previousRow;
+      }
+      return nextRow;
+    });
+
+    if (reusedCount === nextRows.length && previousRows.length === nextRows.length) {
+      return previousRows;
+    }
+
+    return reconciled;
+  };
+
+  const treeRows = createMemo<TreeRow[]>((previousRows = []) => {
+    const nextRows = buildTreeRows({
       snapshotIndex: snapshotIndex(),
       searchMode: searchMode(),
       searchFileNamesOnly: searchFileNamesOnly(),
       searchResults: searchResults(),
-      previewCache: previewCache(),
+      remoteTagResults: remoteTagResults(),
+      previewCache: previewCacheForTree(),
       expandedFolders: expandedFolders(),
       expandedFiles: expandedFiles(),
       collapsedHeadings: collapsedHeadings(),
-    }),
-  );
+    });
+
+    return reconcileTreeRows(previousRows, nextRows);
+  }, []);
 
   const virtualWindow = createMemo(() => {
     const rows = treeRows();
@@ -1102,16 +1283,17 @@ function App() {
         row.kind === "heading" && row.fileId !== undefined && row.headingOrder !== undefined
           ? `${row.fileId}:${row.headingOrder}`
           : "";
+      const rowRichHtml = row.richHtml;
       setSidePreview({
         title: row.kind === "heading" ? row.label : row.kind === "f8" ? "F8 Cite" : "Author / Source",
         subTitle: row.subLabel,
         text: row.copyText,
         headingLevel: row.kind === "heading" ? row.headingLevel ?? null : null,
         kind: row.kind,
-        richHtml: headingCacheKey ? headingPreviewHtmlCache()[headingCacheKey] : undefined,
+        richHtml: headingCacheKey ? headingPreviewHtmlCache()[headingCacheKey] ?? rowRichHtml : rowRichHtml,
       });
 
-      if (row.kind === "heading") {
+      if (row.kind === "heading" && headingCacheKey) {
         queueHeadingPreviewHtml(row.key);
       }
     }
@@ -1144,6 +1326,7 @@ function App() {
         sourcePath: row.sourcePath,
         sectionTitle: row.label,
         content: row.copyText,
+        paragraphXml: row.paragraphXml ?? null,
         targetPath,
         headingLevel: row.kind === "heading" ? row.headingLevel ?? null : null,
         headingOrder: row.kind === "heading" ? row.headingOrder ?? null : null,
@@ -1365,6 +1548,14 @@ function App() {
   });
 
   createEffect(() => {
+    persistBooleanSetting(SEARCH_FILENAME_ONLY_PREFS_KEY, searchFileNamesOnly());
+  });
+
+  createEffect(() => {
+    persistBooleanSetting(SEARCH_DEBATIFY_ENABLED_PREFS_KEY, searchDebatifyEnabled());
+  });
+
+  createEffect(() => {
     treeRows().length;
     const frame = requestAnimationFrame(() => syncTreeViewportState());
     onCleanup(() => cancelAnimationFrame(frame));
@@ -1378,12 +1569,12 @@ function App() {
     const semanticEnabled = searchSemanticEnabled();
     if ((!rootPath && roots().length === 0) || query.length < 2) {
       setSearchResults([]);
-      setIsSearching(false);
+      setIsSearchingLocal(false);
       return;
     }
 
     const debounceMs = query.length > 120 ? 240 : query.length > 42 ? 170 : 120;
-    setIsSearching(true);
+    setIsSearchingLocal(true);
     const requestId = ++searchRequestSeq;
     const timer = setTimeout(() => {
       const invocation = invokeTyped<SearchHit[]>("search_index_hybrid", {
@@ -1408,13 +1599,13 @@ function App() {
         })
         .finally(() => {
           if (requestId === searchRequestSeq) {
-            setIsSearching(false);
+            setIsSearchingLocal(false);
           }
         });
 
       const timeout = setTimeout(() => {
         if (requestId === searchRequestSeq) {
-          setIsSearching(false);
+          setIsSearchingLocal(false);
         }
       }, 1500);
       void invocation.finally(() => {
@@ -1426,13 +1617,63 @@ function App() {
   });
 
   createEffect(() => {
+    const query = searchQuery().trim();
+    const debatifyEnabled = searchDebatifyEnabled();
+    if (!debatifyEnabled || query.length < 2) {
+      setRemoteTagResults([]);
+      setIsSearchingRemote(false);
+      return;
+    }
+
+    const debounceMs = query.length > 120 ? 280 : query.length > 42 ? 200 : 140;
+    setIsSearchingRemote(true);
+    const requestId = ++remoteSearchRequestSeq;
+    const controller = new AbortController();
+
+    const timer = setTimeout(() => {
+      const invocation = searchDebatifyTags(query, { signal: controller.signal })
+        .catch((error) => {
+          if (requestId === remoteSearchRequestSeq && !isAbortError(error)) {
+            setStatus(`Debatify tag search failed: ${String(error)}`);
+          }
+          return [] as DebatifyTagHit[];
+        })
+        .then((results) => {
+          if (requestId === remoteSearchRequestSeq) {
+            startTransition(() => {
+              setRemoteTagResults(results);
+            });
+          }
+        })
+        .finally(() => {
+          if (requestId === remoteSearchRequestSeq) {
+            setIsSearchingRemote(false);
+          }
+        });
+
+      const timeout = setTimeout(() => {
+        if (requestId === remoteSearchRequestSeq) {
+          setIsSearchingRemote(false);
+        }
+      }, 2500);
+      void invocation.finally(() => {
+        clearTimeout(timeout);
+      });
+    }, debounceMs);
+
+    onCleanup(() => {
+      clearTimeout(timer);
+      controller.abort();
+    });
+  });
+
+  createEffect(() => {
     if (!searchMode()) return;
     const ids = Array.from(new Set(searchResults().map((result) => result.fileId))).slice(0, PREVIEW_WARMUP_LIMIT);
     if (ids.length === 0) return;
 
     const requestId = ++previewWarmupSeq;
-    const cache = untrack(() => previewCache());
-    const missing = ids.filter((id) => !cache[id]);
+    const missing = ids.filter((id) => !previewCacheByFileId.has(id));
     if (missing.length === 0) return;
 
     const loadBatch = async (batchIds: number[]) => {
@@ -1494,6 +1735,13 @@ function App() {
         if (targetIsTextEditable(event.target)) return;
         event.preventDefault();
         toggleFileNameSearchMode();
+        return;
+      }
+
+      if (!event.metaKey && !event.ctrlKey && !event.altKey && key.toLowerCase() === "d") {
+        if (targetIsTextEditable(event.target)) return;
+        event.preventDefault();
+        toggleDebatifySearchMode();
         return;
       }
 
@@ -1567,6 +1815,10 @@ function App() {
       if (focusScrollFrame) {
         cancelAnimationFrame(focusScrollFrame);
       }
+      if (treeScrollFrame) {
+        cancelAnimationFrame(treeScrollFrame);
+        treeScrollFrame = 0;
+      }
     });
 
     queueMicrotask(syncTreeViewportState);
@@ -1595,12 +1847,15 @@ function App() {
           runIndexForSelection={runIndexForSelection}
           searchQuery={searchQuery}
           searchFileNamesOnly={searchFileNamesOnly}
+          searchDebatifyEnabled={searchDebatifyEnabled}
           searchSemanticEnabled={searchSemanticEnabled}
           selectedRootPath={selectedRootPath}
           indexProgress={indexProgress}
           setSearchInputRef={setSearchInputElement}
           setSearchQuery={setSearchQuery}
           setSelectedRootPath={setSelectedRootPath}
+          toggleFileNameSearchMode={toggleFileNameSearchMode}
+          toggleDebatifySearchMode={toggleDebatifySearchMode}
           toggleSemanticSearchMode={toggleSemanticSearchMode}
           status={status}
           showCapturePanel={showCapturePanel}
@@ -1656,7 +1911,7 @@ function App() {
                 isLoadingSnapshot={isLoadingSnapshot}
                 isSearching={isSearching}
                 onTreeKeyDown={onTreeKeyDown}
-                onTreeScroll={setTreeScrollTop}
+                onTreeScroll={scheduleTreeScrollTop}
                 openSearchResult={openSearchResult}
                 searchMode={searchMode}
                 selectedRootPath={selectedRootPath}

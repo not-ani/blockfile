@@ -6,6 +6,8 @@ import type {
   SearchHit,
   TreeRow,
 } from "./types";
+import type { DebatifyTagHit } from "./remoteSearch/types";
+import { buildDebatifyTagTreeRows, DEBATIFY_REMOTE_FOLDER_PATH } from "./remoteSearch/treeRows";
 import {
   basename,
   f8RowKey,
@@ -90,6 +92,7 @@ type BuildTreeRowsArgs = {
   searchMode: boolean;
   searchFileNamesOnly: boolean;
   searchResults: SearchHit[];
+  remoteTagResults: DebatifyTagHit[];
   previewCache: Record<number, FilePreview>;
   expandedFolders: Set<string>;
   expandedFiles: Set<number>;
@@ -140,6 +143,7 @@ export const buildTreeRows = (args: BuildTreeRowsArgs): TreeRow[] => {
     searchMode,
     searchFileNamesOnly,
     searchResults,
+    remoteTagResults,
     previewCache,
     expandedFolders,
     expandedFiles,
@@ -169,7 +173,11 @@ export const buildTreeRows = (args: BuildTreeRowsArgs): TreeRow[] => {
       let fileDepth = fileDepthById.get(file.id);
       if (fileDepth === undefined) {
         const ancestorPaths = folderAncestors(file.folderPath);
-        ancestorPaths.forEach((ancestorPath, index) => {
+        let visibleAncestorCount = 0;
+        let ancestorsExpanded = true;
+        for (let index = 0; index < ancestorPaths.length; index += 1) {
+          if (!ancestorsExpanded) break;
+          const ancestorPath = ancestorPaths[index];
           const folder = folderByPath.get(ancestorPath);
           const label = index === 0 ? basename(snap.rootPath) : folder?.name ?? basename(ancestorPath);
           const subLabel = index === 0 ? snap.rootPath : `${folder?.fileCount ?? 0} files`;
@@ -181,10 +189,23 @@ export const buildTreeRows = (args: BuildTreeRowsArgs): TreeRow[] => {
             subLabel,
             folderPath: ancestorPath,
           });
-        });
+          visibleAncestorCount += 1;
+          if (!expandedFolders.has(ancestorPath)) {
+            ancestorsExpanded = false;
+          }
+        }
 
-        fileDepth = ancestorPaths.length;
+        if (!ancestorsExpanded) {
+          fileDepthById.set(file.id, -1);
+          continue;
+        }
+
+        fileDepth = visibleAncestorCount;
         fileDepthById.set(file.id, fileDepth);
+      }
+
+      if (fileDepth < 0) {
+        continue;
       }
 
       pushRow({
@@ -321,6 +342,11 @@ export const buildTreeRows = (args: BuildTreeRowsArgs): TreeRow[] => {
           searchResult: result,
         });
       }
+    }
+
+    const remoteFolderExpanded = expandedFolders.has(DEBATIFY_REMOTE_FOLDER_PATH);
+    for (const remoteRow of buildDebatifyTagTreeRows(remoteTagResults, remoteFolderExpanded)) {
+      pushRow(remoteRow);
     }
 
     return rows;

@@ -166,6 +166,43 @@
     font-family: "Iowan Old Style", "Palatino Linotype", Palatino, "Times New Roman", serif;
   }
 
+  .preview-rich p {
+    @apply mb-5 whitespace-pre-wrap text-neutral-300;
+  }
+
+  .preview-rich strong,
+  .preview-rich b {
+    @apply font-semibold text-neutral-100;
+  }
+
+  .preview-rich em,
+  .preview-rich i {
+    font-style: italic;
+  }
+
+  .preview-rich u {
+    text-decoration-line: underline;
+    text-decoration-thickness: 2px;
+    text-underline-offset: 3px;
+    text-decoration-color: rgba(226, 232, 240, 0.95);
+    text-decoration-skip-ink: none;
+  }
+
+  .preview-rich span[style*="text-decoration:underline"],
+  .preview-rich span[style*="text-decoration-line:underline"] {
+    text-decoration-line: underline;
+    text-decoration-thickness: 2px;
+    text-underline-offset: 3px;
+    text-decoration-color: rgba(226, 232, 240, 0.95);
+    text-decoration-skip-ink: none;
+  }
+
+  .preview-rich mark {
+    @apply rounded px-1;
+    background: rgba(250, 204, 21, 0.26);
+    color: inherit;
+  }
+
   .preview-rich .bf-preview-p {
     @apply mb-5 whitespace-pre-wrap text-neutral-300;
   }

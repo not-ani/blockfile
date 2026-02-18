@@ -15,6 +15,8 @@ use crate::types::{RelationshipDef, SourceStyleDefinition, StyledSection};
 use crate::util::{is_probable_author_line, path_display};
 use crate::CommandResult;
 
+const CITATION_STYLE_PLACEHOLDER: &str = "__BF_CITATION_STYLE__";
+
 pub(crate) fn xml_escape_text(value: &str) -> String {
     value
         .replace('&', "&amp;")
@@ -657,6 +659,104 @@ pub(crate) fn remap_relationship_ids(
     }
 }
 
+fn citation_style_score(style_id: &str, style_name: &str) -> i32 {
+    let combined = format!("{} {}", style_id, style_name).to_lowercase();
+    let has_f8 = combined.contains("f8");
+    let has_citation = combined.contains("citation");
+    let has_cite = combined.contains("cite");
+    let has_quote = combined.contains("quote");
+
+    if has_f8 && (has_cite || has_citation) {
+        return 600;
+    }
+    if has_citation {
+        return 520;
+    }
+    if has_cite {
+        return 430;
+    }
+    if has_quote {
+        return 280;
+    }
+    if combined == "normal" {
+        return -100;
+    }
+    0
+}
+
+fn resolve_citation_paragraph_style_id(styles_xml: &str) -> Option<String> {
+    let Ok(document) = Document::parse(styles_xml) else {
+        return None;
+    };
+
+    let mut best_match: Option<(i32, String)> = None;
+    let mut quote_style_id: Option<String> = None;
+
+    for style_node in document
+        .descendants()
+        .filter(|node| has_tag(*node, "style"))
+    {
+        let style_type = attribute_value(style_node, "type").unwrap_or("");
+        if !style_type.eq_ignore_ascii_case("paragraph") {
+            continue;
+        }
+
+        let Some(style_id_raw) = attribute_value(style_node, "styleId") else {
+            continue;
+        };
+        let style_id = style_id_raw.trim();
+        if style_id.is_empty() {
+            continue;
+        }
+
+        let style_name = style_node
+            .children()
+            .find(|child| has_tag(*child, "name"))
+            .and_then(|name_node| attribute_value(name_node, "val"))
+            .unwrap_or("")
+            .trim();
+
+        let score = citation_style_score(style_id, style_name);
+        if score > 0 {
+            let replace_current = best_match
+                .as_ref()
+                .map(|(best_score, _)| score > *best_score)
+                .unwrap_or(true);
+            if replace_current {
+                best_match = Some((score, style_id.to_string()));
+            }
+        }
+
+        let style_id_lower = style_id.to_lowercase();
+        let style_name_lower = style_name.to_lowercase();
+        if quote_style_id.is_none()
+            && (style_id_lower == "quote"
+                || style_name_lower == "quote"
+                || style_name_lower == "intense quote")
+        {
+            quote_style_id = Some(style_id.to_string());
+        }
+    }
+
+    if let Some((_, style_id)) = best_match {
+        return Some(style_id);
+    }
+    quote_style_id
+}
+
+fn apply_citation_style_placeholders(
+    paragraph_xml: &mut [String],
+    citation_style_id: Option<&str>,
+) {
+    let citation_style_id = citation_style_id.unwrap_or("Quote");
+    let escaped_style_id = xml_escape_attr(citation_style_id);
+    for paragraph in paragraph_xml.iter_mut() {
+        if paragraph.contains(CITATION_STYLE_PLACEHOLDER) {
+            *paragraph = paragraph.replace(CITATION_STYLE_PLACEHOLDER, &escaped_style_id);
+        }
+    }
+}
+
 pub(crate) fn rewrite_docx_with_parts(
     capture_path: &Path,
     replacements: &HashMap<String, Vec<u8>>,
@@ -814,6 +914,12 @@ pub(crate) fn append_capture_to_docx(
             }
         }
     }
+
+    let citation_paragraph_style_id = resolve_citation_paragraph_style_id(&target_styles_xml);
+    apply_citation_style_placeholders(
+        &mut section_paragraph_xml,
+        citation_paragraph_style_id.as_deref(),
+    );
 
     let mut fragment = String::new();
     if !document_has_body_content(&target_document_xml) {

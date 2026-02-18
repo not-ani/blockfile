@@ -70,6 +70,7 @@ pub(crate) fn insert_capture(
     source_path: String,
     section_title: String,
     content: String,
+    paragraph_xml: Option<Vec<String>>,
     target_path: Option<String>,
     heading_level: Option<i64>,
     heading_order: Option<i64>,
@@ -118,7 +119,25 @@ pub(crate) fn insert_capture(
     let capture_id = connection.last_insert_rowid();
     let capture_path = capture_docx_path(&canonical_root, &target_relative_path);
     let source_file_path = Path::new(&source_path);
-    let styled_section = extract_styled_section(source_file_path, heading_order, &content_value);
+    let styled_section = paragraph_xml
+        .and_then(|entries| {
+            let cleaned = entries
+                .into_iter()
+                .map(|entry| entry.trim().to_string())
+                .filter(|entry| !entry.is_empty())
+                .collect::<Vec<String>>();
+            if cleaned.is_empty() {
+                None
+            } else {
+                Some(StyledSection {
+                    paragraph_xml: cleaned,
+                    style_ids: HashSet::new(),
+                    relationship_ids: HashSet::new(),
+                    used_source_xml: false,
+                })
+            }
+        })
+        .unwrap_or_else(|| extract_styled_section(source_file_path, heading_order, &content_value));
     append_capture_to_docx(
         &capture_path,
         source_file_path,

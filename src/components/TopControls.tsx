@@ -5,6 +5,7 @@ import type { IndexProgress, RootSummary } from "../lib/types";
 type TopControlsProps = {
   searchQuery: Accessor<string>;
   searchFileNamesOnly: Accessor<boolean>;
+  searchDebatifyEnabled: Accessor<boolean>;
   searchSemanticEnabled: Accessor<boolean>;
   setSearchQuery: (value: string) => void;
   setSearchInputRef: (element: HTMLInputElement) => void;
@@ -24,6 +25,8 @@ type TopControlsProps = {
   showPreviewPanel: Accessor<boolean>;
   toggleCapturePanel: () => void;
   togglePreviewPanel: () => void;
+  toggleFileNameSearchMode: () => void;
+  toggleDebatifySearchMode: () => void;
   toggleSemanticSearchMode: () => void;
 };
 
@@ -116,11 +119,30 @@ export default function TopControls(props: TopControlsProps) {
           
           <div class="h-4 w-px bg-neutral-700 mx-1" />
           
-          <Show when={props.searchFileNamesOnly()}>
-            <span class="vercel-badge border-cyan-500/30 bg-cyan-500/10 text-cyan-300 text-[10px]">
-              Filename only (F)
-            </span>
-          </Show>
+          <button
+            class={`vercel-badge transition ${
+              props.searchFileNamesOnly()
+                ? "border-cyan-500/30 bg-cyan-500/10 text-cyan-300 hover:border-cyan-400/50"
+                : "border-neutral-700 bg-neutral-800 text-neutral-300 hover:border-neutral-600"
+            }`}
+            onClick={props.toggleFileNameSearchMode}
+            title="Toggle filename-only search (F)"
+            type="button"
+          >
+            {props.searchFileNamesOnly() ? "Filename only: on" : "Filename only: off"}
+          </button>
+          <button
+            class={`vercel-badge transition ${
+              props.searchDebatifyEnabled()
+                ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-300 hover:border-emerald-400/50"
+                : "border-neutral-700 bg-neutral-800 text-neutral-300 hover:border-neutral-600"
+            }`}
+            onClick={props.toggleDebatifySearchMode}
+            title="Toggle Debatify API tag responses (D)"
+            type="button"
+          >
+            {props.searchDebatifyEnabled() ? "Debatify API: on" : "Debatify API: off"}
+          </button>
           <button
             class={`vercel-badge transition ${
               props.searchSemanticEnabled()
