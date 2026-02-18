@@ -228,6 +228,8 @@ struct RelationshipDef {
 const DEFAULT_CAPTURE_TARGET: &str = "BlockFile-Captures.docx";
 const INDEX_PROGRESS_EVENT: &str = "index-progress";
 const INDEX_PROGRESS_EMIT_INTERVAL_MS: i64 = 120;
+const FUZZY_MIN_QUERY_CHARS: usize = 3;
+const FUZZY_FILL_RATIO_GATE: f64 = 0.42;
 
 fn now_ms() -> i64 {
     epoch_ms(SystemTime::now())
@@ -1327,8 +1329,12 @@ fn open_database(app: &AppHandle) -> CommandResult<Connection> {
             );
 
             CREATE INDEX IF NOT EXISTS idx_files_root_relative ON files(root_id, relative_path);
+            CREATE INDEX IF NOT EXISTS idx_files_root_modified ON files(root_id, modified_ms DESC, id DESC);
             CREATE INDEX IF NOT EXISTS idx_headings_file ON headings(file_id);
+            CREATE INDEX IF NOT EXISTS idx_headings_normalized_length ON headings(length(normalized));
             CREATE INDEX IF NOT EXISTS idx_authors_file ON authors(file_id);
+            CREATE INDEX IF NOT EXISTS idx_authors_normalized_length ON authors(length(normalized));
+            CREATE INDEX IF NOT EXISTS idx_files_relative_length ON files(length(relative_path));
             CREATE INDEX IF NOT EXISTS idx_captures_root ON captures(root_id, id);
 
             CREATE VIRTUAL TABLE IF NOT EXISTS search_fts USING fts5(
@@ -1510,7 +1516,11 @@ fn tokenize_for_fts(query: &str) -> String {
         .join(" AND ")
 }
 
-fn normalized_levenshtein_similarity(left: &str, right: &str) -> f64 {
+fn normalized_levenshtein_similarity_with_floor(
+    left: &str,
+    right: &str,
+    min_similarity: f64,
+) -> f64 {
     if left.is_empty() || right.is_empty() {
         return 0.0;
     }
@@ -1525,30 +1535,46 @@ fn normalized_levenshtein_similarity(left: &str, right: &str) -> f64 {
     if left_len == 0 || right_len == 0 {
         return 0.0;
     }
+    let max_len = left_len.max(right_len);
+    let similarity_floor = min_similarity.clamp(0.0, 1.0);
+    let max_allowed_distance = ((1.0 - similarity_floor) * max_len as f64).ceil() as usize;
+    if left_len.abs_diff(right_len) > max_allowed_distance {
+        return 0.0;
+    }
 
     let mut previous_row = (0..=right_len).collect::<Vec<usize>>();
     let mut current_row = vec![0_usize; right_len + 1];
 
     for (left_index, left_char) in left_chars.iter().enumerate() {
         current_row[0] = left_index + 1;
+        let mut row_min = current_row[0];
 
         for (right_index, right_char) in right_chars.iter().enumerate() {
             let substitution_cost = usize::from(left_char != right_char);
             let deletion = previous_row[right_index + 1] + 1;
             let insertion = current_row[right_index] + 1;
             let substitution = previous_row[right_index] + substitution_cost;
-            current_row[right_index + 1] = deletion.min(insertion).min(substitution);
+            let distance = deletion.min(insertion).min(substitution);
+            current_row[right_index + 1] = distance;
+            row_min = row_min.min(distance);
+        }
+
+        if row_min > max_allowed_distance {
+            return 0.0;
         }
 
         std::mem::swap(&mut previous_row, &mut current_row);
     }
 
     let edit_distance = previous_row[right_len];
-    let max_len = left_len.max(right_len);
+    if edit_distance > max_allowed_distance {
+        return 0.0;
+    }
+
     1.0 - (edit_distance as f64 / max_len as f64)
 }
 
-fn fuzzy_similarity(query: &str, candidate: &str) -> f64 {
+fn fuzzy_similarity(query: &str, query_tokens: &[&str], candidate: &str, threshold: f64) -> f64 {
     if query.is_empty() || candidate.is_empty() {
         return 0.0;
     }
@@ -1560,18 +1586,44 @@ fn fuzzy_similarity(query: &str, candidate: &str) -> f64 {
         return 0.88;
     }
 
-    let edit_similarity = normalized_levenshtein_similarity(query, candidate);
+    let query_len = query.chars().count();
+    let candidate_len = candidate.chars().count();
+    let max_len = query_len.max(candidate_len);
+    if max_len == 0 {
+        return 0.0;
+    }
+    let max_allowed_distance = ((1.0 - threshold.clamp(0.0, 1.0)) * max_len as f64).ceil() as usize;
+    if query_len.abs_diff(candidate_len) > max_allowed_distance.saturating_add(2) {
+        return 0.0;
+    }
 
-    let query_tokens = query.split_whitespace().collect::<Vec<&str>>();
+    let edit_floor = ((threshold - 0.28).max(0.0) / 0.72).clamp(0.0, 1.0);
+    let edit_similarity =
+        normalized_levenshtein_similarity_with_floor(query, candidate, edit_floor);
+
     let candidate_tokens = candidate.split_whitespace().collect::<Vec<&str>>();
+    if candidate_tokens.is_empty() || query_tokens.is_empty() {
+        return edit_similarity;
+    }
 
+    let token_floor = (threshold * 0.55).clamp(0.0, 1.0);
     let mut best_token_similarity = 0.0_f64;
-    for query_token in &query_tokens {
+    for query_token in query_tokens {
         for candidate_token in &candidate_tokens {
-            let similarity = normalized_levenshtein_similarity(query_token, candidate_token);
+            let similarity = normalized_levenshtein_similarity_with_floor(
+                query_token,
+                candidate_token,
+                token_floor,
+            );
             if similarity > best_token_similarity {
                 best_token_similarity = similarity;
+                if best_token_similarity >= 0.995 {
+                    break;
+                }
             }
+        }
+        if best_token_similarity >= 0.995 {
+            break;
         }
     }
 
@@ -1589,6 +1641,44 @@ fn fuzzy_threshold(query: &str) -> f64 {
     } else {
         0.74
     }
+}
+
+fn should_run_fuzzy_fallback(
+    result_count: usize,
+    max_results: usize,
+    normalized_query: &str,
+) -> bool {
+    if max_results == 0 || result_count >= max_results {
+        return false;
+    }
+
+    let query_len = normalized_query.chars().count();
+    if query_len < FUZZY_MIN_QUERY_CHARS {
+        return false;
+    }
+
+    if result_count == 0 {
+        return true;
+    }
+
+    if query_len <= FUZZY_MIN_QUERY_CHARS {
+        return false;
+    }
+
+    let fill_ratio = result_count as f64 / max_results as f64;
+    fill_ratio < FUZZY_FILL_RATIO_GATE
+}
+
+fn adaptive_candidate_limit(
+    remaining_slots: usize,
+    multiplier: usize,
+    min_limit: usize,
+    max_limit: usize,
+) -> i64 {
+    let target = remaining_slots
+        .saturating_mul(multiplier)
+        .clamp(min_limit, max_limit);
+    i64::try_from(target).unwrap_or(i64::try_from(max_limit).unwrap_or(0))
 }
 
 fn has_tag(node: Node<'_, '_>, expected: &str) -> bool {
@@ -3494,18 +3584,19 @@ fn search_index(
         }
     }
 
-    if results.len() < max_results_usize {
+    if should_run_fuzzy_fallback(results.len(), max_results_usize, &normalized_query) {
         let threshold = fuzzy_threshold(&normalized_query);
+        let query_tokens = normalized_query.split_whitespace().collect::<Vec<&str>>();
         let query_len_chars = i64::try_from(normalized_query.chars().count()).unwrap_or(1);
         let min_heading_len = (query_len_chars - 6).max(1);
         let max_heading_len = query_len_chars + 36;
         let min_path_len = (query_len_chars - 6).max(1);
         let max_path_len = query_len_chars + 160;
+        let remaining_slots = max_results_usize.saturating_sub(results.len());
 
-        let heading_candidate_limit =
-            i64::try_from((max_results_usize.saturating_mul(14)).clamp(120, 1800)).unwrap_or(600);
-        let file_candidate_limit =
-            i64::try_from((max_results_usize.saturating_mul(8)).clamp(80, 1200)).unwrap_or(400);
+        let heading_candidate_limit = adaptive_candidate_limit(remaining_slots, 6, 48, 700);
+        let file_candidate_limit = adaptive_candidate_limit(remaining_slots, 4, 36, 480);
+        let author_candidate_limit = adaptive_candidate_limit(remaining_slots, 5, 42, 560);
 
         let mut fuzzy_candidates = Vec::new();
 
@@ -3519,7 +3610,8 @@ fn search_index(
                       f.absolute_path,
                       h.level,
                       h.text,
-                      h.heading_order
+                      h.heading_order,
+                      h.normalized
                     FROM headings h
                     JOIN files f ON f.id = h.file_id
                     WHERE (?1 IS NULL OR f.root_id = ?1)
@@ -3546,6 +3638,7 @@ fn search_index(
                             row.get::<_, i64>(3)?,
                             row.get::<_, String>(4)?,
                             row.get::<_, i64>(5)?,
+                            row.get::<_, String>(6)?,
                         ))
                     },
                 )
@@ -3559,18 +3652,31 @@ fn search_index(
                     heading_level,
                     heading_text,
                     heading_order,
+                    heading_normalized,
                 ) = row.map_err(|error| format!("Could not parse fuzzy heading row: {error}"))?;
 
-                let heading_normalized = normalize_for_search(&heading_text);
                 if heading_normalized.is_empty() {
                     continue;
                 }
 
-                let heading_similarity = fuzzy_similarity(&normalized_query, &heading_normalized);
-                let path_similarity =
-                    fuzzy_similarity(&normalized_query, &normalize_for_search(&relative_path))
-                        * 0.84;
-                let similarity = heading_similarity.max(path_similarity);
+                let heading_similarity = fuzzy_similarity(
+                    &normalized_query,
+                    &query_tokens,
+                    &heading_normalized,
+                    threshold,
+                );
+                let similarity = if heading_similarity >= threshold {
+                    heading_similarity
+                } else {
+                    let normalized_relative_path = normalize_for_search(&relative_path);
+                    let path_similarity = fuzzy_similarity(
+                        &normalized_query,
+                        &query_tokens,
+                        &normalized_relative_path,
+                        threshold,
+                    ) * 0.84;
+                    heading_similarity.max(path_similarity)
+                };
                 if similarity < threshold {
                     continue;
                 }
@@ -3626,11 +3732,25 @@ fn search_index(
                     row.map_err(|error| format!("Could not parse fuzzy file row: {error}"))?;
 
                 let file_name = file_name_from_relative(&relative_path);
-                let path_similarity =
-                    fuzzy_similarity(&normalized_query, &normalize_for_search(&relative_path));
-                let name_similarity =
-                    fuzzy_similarity(&normalized_query, &normalize_for_search(&file_name)) * 0.94;
-                let similarity = path_similarity.max(name_similarity);
+                let normalized_relative_path = normalize_for_search(&relative_path);
+                let path_similarity = fuzzy_similarity(
+                    &normalized_query,
+                    &query_tokens,
+                    &normalized_relative_path,
+                    threshold,
+                );
+                let similarity = if path_similarity >= threshold {
+                    path_similarity
+                } else {
+                    let normalized_file_name = normalize_for_search(&file_name);
+                    let name_similarity = fuzzy_similarity(
+                        &normalized_query,
+                        &query_tokens,
+                        &normalized_file_name,
+                        threshold,
+                    ) * 0.94;
+                    path_similarity.max(name_similarity)
+                };
                 if similarity < threshold {
                     continue;
                 }
@@ -3650,9 +3770,6 @@ fn search_index(
         }
 
         {
-            let author_candidate_limit =
-                i64::try_from((max_results_usize.saturating_mul(10)).clamp(100, 1500))
-                    .unwrap_or(500);
             let mut statement = connection
                 .prepare(
                     "
@@ -3661,7 +3778,8 @@ fn search_index(
                       f.relative_path,
                       f.absolute_path,
                       a.text,
-                      a.author_order
+                      a.author_order,
+                      a.normalized
                     FROM authors a
                     JOIN files f ON f.id = a.file_id
                     WHERE (?1 IS NULL OR f.root_id = ?1)
@@ -3687,17 +3805,32 @@ fn search_index(
                             row.get::<_, String>(2)?,
                             row.get::<_, String>(3)?,
                             row.get::<_, i64>(4)?,
+                            row.get::<_, String>(5)?,
                         ))
                     },
                 )
                 .map_err(|error| format!("Could not run fuzzy author query: {error}"))?;
 
             for row in rows {
-                let (file_id, relative_path, absolute_path, author_text, author_order) =
-                    row.map_err(|error| format!("Could not parse fuzzy author row: {error}"))?;
+                let (
+                    file_id,
+                    relative_path,
+                    absolute_path,
+                    author_text,
+                    author_order,
+                    normalized_author,
+                ) = row.map_err(|error| format!("Could not parse fuzzy author row: {error}"))?;
 
-                let similarity =
-                    fuzzy_similarity(&normalized_query, &normalize_for_search(&author_text));
+                if normalized_author.is_empty() {
+                    continue;
+                }
+
+                let similarity = fuzzy_similarity(
+                    &normalized_query,
+                    &query_tokens,
+                    &normalized_author,
+                    threshold,
+                );
                 if similarity < threshold {
                     continue;
                 }
