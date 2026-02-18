@@ -32,9 +32,12 @@ pub(crate) fn path_display(path: &Path) -> String {
 
 pub(crate) fn suggested_parse_chunk_size() -> usize {
     std::thread::available_parallelism()
-        .map(|parallelism| parallelism.get().saturating_mul(2))
-        .unwrap_or(8)
-        .clamp(8, 64)
+        .map(|parallelism| {
+            let threads = parallelism.get();
+            threads.saturating_div(2).max(2)
+        })
+        .unwrap_or(4)
+        .clamp(2, 12)
 }
 
 pub(crate) fn emit_index_progress(

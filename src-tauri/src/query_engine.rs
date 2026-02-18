@@ -13,8 +13,8 @@ use crate::vector::{self, VECTOR_MIN_QUERY_CHARS};
 use crate::CommandResult;
 
 const DEFAULT_RESULT_LIMIT: usize = 120;
-const CACHE_CAPACITY: usize = 120;
-const CACHE_TTL_MS: i64 = 20_000;
+const CACHE_CAPACITY: usize = 480;
+const CACHE_TTL_MS: i64 = 120_000;
 const LEXICAL_SOFT_BUDGET_MS: u64 = 60;
 const HYBRID_SOFT_BUDGET_MS: u64 = 180;
 
@@ -65,6 +65,13 @@ fn query_cache() -> &'static std::sync::Mutex<QueryCache> {
     QUERY_CACHE.get_or_init(|| std::sync::Mutex::new(QueryCache::default()))
 }
 
+pub(crate) fn clear_query_cache() {
+    if let Ok(mut cache) = query_cache().lock() {
+        cache.entries.clear();
+        cache.order.clear();
+    }
+}
+
 fn normalize_query(query: &str) -> String {
     query
         .trim()
@@ -110,6 +117,20 @@ fn dedupe_key(hit: &SearchHit) -> String {
         hit.heading_text.clone().unwrap_or_default(),
         hit.relative_path
     )
+}
+
+async fn run_lexical_search_task(
+    app: AppHandle,
+    query: String,
+    requested_root_id: Option<i64>,
+    limit: usize,
+    file_name_only: bool,
+) -> CommandResult<Vec<SearchHit>> {
+    tauri::async_runtime::spawn_blocking(move || {
+        lexical::search(&app, &query, requested_root_id, limit, file_name_only)
+    })
+    .await
+    .map_err(|error| format!("Lexical search task failed: {error}"))?
 }
 
 fn fuse_rrf(
@@ -282,7 +303,14 @@ pub(crate) async fn search_hybrid(
     }
 
     if file_name_only {
-        let lexical_hits = lexical::search(app, cleaned_query, requested_root_id, limit, true)?;
+        let lexical_hits = run_lexical_search_task(
+            app.clone(),
+            cleaned_query.to_string(),
+            requested_root_id,
+            limit,
+            true,
+        )
+        .await?;
         if let Ok(mut cache) = query_cache().lock() {
             cache.put(key, lexical_hits.clone());
         }
@@ -290,7 +318,14 @@ pub(crate) async fn search_hybrid(
     }
 
     if !semantic_enabled {
-        let lexical_hits = lexical::search(app, cleaned_query, requested_root_id, limit, false)?;
+        let lexical_hits = run_lexical_search_task(
+            app.clone(),
+            cleaned_query.to_string(),
+            requested_root_id,
+            limit,
+            false,
+        )
+        .await?;
         if let Ok(mut cache) = query_cache().lock() {
             cache.put(key, lexical_hits.clone());
         }
@@ -299,16 +334,17 @@ pub(crate) async fn search_hybrid(
 
     vector::trigger_rebuild(app.clone(), false);
 
-    let app_for_lexical = app.clone();
-    let query_for_lexical = cleaned_query.to_string();
-    let lexical_task = tauri::async_runtime::spawn_blocking(move || {
-        lexical::search(&app_for_lexical, &query_for_lexical, requested_root_id, limit, false)
-    });
+    let lexical_task = run_lexical_search_task(
+        app.clone(),
+        cleaned_query.to_string(),
+        requested_root_id,
+        limit,
+        false,
+    );
     let semantic_task = vector::search(app, cleaned_query, requested_root_id, limit);
-    let (lexical_join, semantic_result) = future::join(lexical_task, semantic_task).await;
+    let (lexical_result, semantic_result) = future::join(lexical_task, semantic_task).await;
 
-    let lexical_hits =
-        lexical_join.map_err(|error| format!("Hybrid lexical task failed: {error}"))??;
+    let lexical_hits = lexical_result?;
     let semantic_hits = semantic_result.unwrap_or_default();
     let fused = fuse_rrf(&lexical_hits, &semantic_hits, limit);
 

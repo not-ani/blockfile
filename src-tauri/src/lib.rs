@@ -28,6 +28,7 @@ pub fn run() {
             commands::insert_capture,
             commands::list_capture_targets,
             commands::get_capture_target_preview,
+            commands::add_capture_heading,
             commands::delete_capture_heading,
             commands::move_capture_heading,
             commands::list_roots,
@@ -37,7 +38,8 @@ pub fn run() {
             commands::get_heading_preview_html,
             commands::search_index,
             commands::search_index_semantic,
-            commands::search_index_hybrid
+            commands::search_index_hybrid,
+            commands::benchmark_root_performance
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

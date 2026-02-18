@@ -1,9 +1,10 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
+use std::time::Instant;
 
 use rayon::prelude::*;
-use rusqlite::params;
+use rusqlite::{params, Connection};
 use tauri::AppHandle;
 use walkdir::WalkDir;
 
@@ -11,10 +12,11 @@ use crate::chunking::build_chunks;
 use crate::db::{add_or_get_root_id, load_existing_files, open_database, root_id};
 use crate::docx_capture::{
     append_capture_to_docx, ensure_valid_capture_docx, extract_styled_section,
-    rewrite_docx_with_parts,
+    paragraph_xml_heading, rewrite_docx_with_parts,
 };
 use crate::docx_parse::{build_heading_ranges, has_tag, parse_docx_paragraphs, read_docx_part};
 use crate::indexer::rebuild_lexical_index;
+use crate::lexical;
 use crate::preview::{extract_heading_preview_html, extract_preview_content};
 use crate::query_engine;
 use crate::search::normalize_for_search;
@@ -430,6 +432,49 @@ pub(crate) fn move_capture_heading(
 }
 
 #[tauri::command]
+pub(crate) fn add_capture_heading(
+    _app: AppHandle,
+    root_path: String,
+    target_path: String,
+    heading_level: i64,
+    heading_text: String,
+    selected_target_heading_order: Option<i64>,
+) -> CommandResult<CaptureTargetPreview> {
+    if !(1..=4).contains(&heading_level) {
+        return Err("Heading level must be H1, H2, H3, or H4.".to_string());
+    }
+
+    let trimmed_text = heading_text.trim();
+    if trimmed_text.is_empty() {
+        return Err("Heading name cannot be empty.".to_string());
+    }
+
+    let canonical_root = canonicalize_folder(&root_path)?;
+    let normalized_target = normalize_capture_target_path(Some(&target_path))?;
+    let absolute_path = capture_docx_path(&canonical_root, &normalized_target);
+
+    let styled_section = StyledSection {
+        paragraph_xml: vec![paragraph_xml_heading(heading_level, trimmed_text)],
+        style_ids: HashSet::new(),
+        relationship_ids: HashSet::new(),
+        used_source_xml: false,
+    };
+
+    append_capture_to_docx(
+        &absolute_path,
+        &absolute_path,
+        Some(heading_level),
+        selected_target_heading_order.filter(|value| *value > 0),
+        &styled_section,
+    )?;
+
+    Ok(capture_target_preview_for_path(
+        &canonical_root,
+        &normalized_target,
+    ))
+}
+
+#[tauri::command]
 pub(crate) fn list_roots(app: AppHandle) -> CommandResult<Vec<RootSummary>> {
     let connection = open_database(&app)?;
     let mut statement = connection
@@ -776,7 +821,7 @@ pub(crate) fn index_root(app: AppHandle, path: String) -> CommandResult<IndexSta
             }
 
             for chunk in parsed.chunks {
-                let chunk_id = format!("{}:{}", parsed.candidate.file_hash, chunk.chunk_order);
+                let chunk_id = format!("{}:{}:{}", root_id, file_id, chunk.chunk_order);
                 transaction
                     .execute(
                         "
@@ -1107,13 +1152,17 @@ pub(crate) fn get_heading_preview_html(
 }
 
 #[tauri::command]
-pub(crate) fn search_index(
+pub(crate) async fn search_index(
     app: AppHandle,
     query: String,
     root_path: Option<String>,
     limit: Option<usize>,
 ) -> CommandResult<Vec<SearchHit>> {
-    query_engine::search_lexical(&app, &query, root_path, limit)
+    tauri::async_runtime::spawn_blocking(move || {
+        query_engine::search_lexical(&app, &query, root_path, limit)
+    })
+    .await
+    .map_err(|error| format!("Lexical search command failed: {error}"))?
 }
 
 #[tauri::command]
@@ -1144,4 +1193,561 @@ pub(crate) async fn search_index_hybrid(
         semantic_enabled.unwrap_or(true),
     )
     .await
+}
+
+fn elapsed_ms(started: Instant) -> f64 {
+    started.elapsed().as_secs_f64() * 1000.0
+}
+
+fn percentile(sorted_samples: &[f64], percentile: f64) -> f64 {
+    if sorted_samples.is_empty() {
+        return 0.0;
+    }
+    let clamped = percentile.clamp(0.0, 1.0);
+    let last = sorted_samples.len().saturating_sub(1);
+    let index = ((last as f64) * clamped).round() as usize;
+    sorted_samples[index.min(last)]
+}
+
+fn latency_stats(samples: &[f64]) -> BenchmarkLatencyStats {
+    if samples.is_empty() {
+        return BenchmarkLatencyStats::default();
+    }
+
+    let mut sorted = samples.to_vec();
+    sorted.sort_by(|left, right| {
+        left.partial_cmp(right)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let sum = sorted.iter().copied().sum::<f64>();
+    BenchmarkLatencyStats {
+        runs: sorted.len(),
+        min_ms: *sorted.first().unwrap_or(&0.0),
+        p50_ms: percentile(&sorted, 0.50),
+        p95_ms: percentile(&sorted, 0.95),
+        max_ms: *sorted.last().unwrap_or(&0.0),
+        mean_ms: sum / (sorted.len() as f64),
+    }
+}
+
+fn build_task_result(
+    enabled: bool,
+    samples: &[f64],
+    total_hits: usize,
+    error: Option<String>,
+) -> BenchmarkTaskResult {
+    BenchmarkTaskResult {
+        enabled,
+        error,
+        total_hits,
+        latency: latency_stats(samples),
+    }
+}
+
+fn query_candidates_from_text(text: &str) -> Vec<String> {
+    let normalized = normalize_for_search(text);
+    if normalized.is_empty() {
+        return Vec::new();
+    }
+
+    let tokens = normalized
+        .split_whitespace()
+        .filter(|token| token.len() >= 3)
+        .map(|token| token.to_string())
+        .collect::<Vec<String>>();
+    if tokens.is_empty() {
+        return Vec::new();
+    }
+
+    let mut candidates = Vec::new();
+    let head_three = tokens.iter().take(3).cloned().collect::<Vec<String>>();
+    if !head_three.is_empty() {
+        candidates.push(head_three.join(" "));
+    }
+    if tokens.len() >= 2 {
+        candidates.push(tokens.iter().take(2).cloned().collect::<Vec<String>>().join(" "));
+    }
+    candidates.push(tokens[0].clone());
+    if tokens.len() >= 4 {
+        let tail_two = tokens[tokens.len().saturating_sub(2)..]
+            .iter()
+            .cloned()
+            .collect::<Vec<String>>()
+            .join(" ");
+        candidates.push(tail_two);
+    }
+
+    candidates
+}
+
+fn push_query_candidate(
+    target: &mut Vec<String>,
+    seen: &mut HashSet<String>,
+    candidate: String,
+    max_queries: usize,
+) {
+    let normalized = normalize_for_search(&candidate);
+    if normalized.chars().count() < 2 {
+        return;
+    }
+    if seen.insert(normalized.clone()) {
+        target.push(normalized);
+    }
+    if target.len() > max_queries {
+        target.truncate(max_queries);
+    }
+}
+
+fn collect_benchmark_queries(
+    connection: &Connection,
+    root_id_value: i64,
+    provided_queries: &[String],
+    max_queries: usize,
+) -> CommandResult<Vec<String>> {
+    let mut queries = Vec::new();
+    let mut seen = HashSet::new();
+
+    for provided in provided_queries {
+        for candidate in query_candidates_from_text(provided) {
+            if queries.len() >= max_queries {
+                return Ok(queries);
+            }
+            push_query_candidate(&mut queries, &mut seen, candidate, max_queries);
+        }
+    }
+
+    let mut heading_statement = connection
+        .prepare(
+            "
+            SELECT h.text
+            FROM headings h
+            JOIN files f ON f.id = h.file_id
+            WHERE f.root_id = ?1
+            ORDER BY length(h.text) DESC, h.id ASC
+            LIMIT 240
+            ",
+        )
+        .map_err(|error| format!("Could not prepare benchmark heading query source: {error}"))?;
+    let heading_rows = heading_statement
+        .query_map(params![root_id_value], |row| row.get::<_, String>(0))
+        .map_err(|error| format!("Could not load benchmark heading query source: {error}"))?;
+    for row in heading_rows {
+        if queries.len() >= max_queries {
+            break;
+        }
+        let text = row.map_err(|error| format!("Could not parse benchmark heading text: {error}"))?;
+        for candidate in query_candidates_from_text(&text) {
+            if queries.len() >= max_queries {
+                break;
+            }
+            push_query_candidate(&mut queries, &mut seen, candidate, max_queries);
+        }
+    }
+
+    let mut author_statement = connection
+        .prepare(
+            "
+            SELECT a.text
+            FROM authors a
+            JOIN files f ON f.id = a.file_id
+            WHERE f.root_id = ?1
+            ORDER BY a.id DESC
+            LIMIT 120
+            ",
+        )
+        .map_err(|error| format!("Could not prepare benchmark author query source: {error}"))?;
+    let author_rows = author_statement
+        .query_map(params![root_id_value], |row| row.get::<_, String>(0))
+        .map_err(|error| format!("Could not load benchmark author query source: {error}"))?;
+    for row in author_rows {
+        if queries.len() >= max_queries {
+            break;
+        }
+        let text = row.map_err(|error| format!("Could not parse benchmark author text: {error}"))?;
+        for candidate in query_candidates_from_text(&text) {
+            if queries.len() >= max_queries {
+                break;
+            }
+            push_query_candidate(&mut queries, &mut seen, candidate, max_queries);
+        }
+    }
+
+    let mut file_statement = connection
+        .prepare(
+            "
+            SELECT relative_path
+            FROM files
+            WHERE root_id = ?1
+            ORDER BY heading_count DESC, modified_ms DESC
+            LIMIT 180
+            ",
+        )
+        .map_err(|error| format!("Could not prepare benchmark file query source: {error}"))?;
+    let file_rows = file_statement
+        .query_map(params![root_id_value], |row| row.get::<_, String>(0))
+        .map_err(|error| format!("Could not load benchmark file query source: {error}"))?;
+    for row in file_rows {
+        if queries.len() >= max_queries {
+            break;
+        }
+        let relative_path_value =
+            row.map_err(|error| format!("Could not parse benchmark file relative path: {error}"))?;
+        let file_name = file_name_from_relative(&relative_path_value);
+        for candidate in query_candidates_from_text(&file_name) {
+            if queries.len() >= max_queries {
+                break;
+            }
+            push_query_candidate(&mut queries, &mut seen, candidate, max_queries);
+        }
+    }
+
+    if queries.is_empty() {
+        for fallback in [
+            "introduction",
+            "method",
+            "results",
+            "discussion",
+            "conclusion",
+            "references",
+        ] {
+            push_query_candidate(
+                &mut queries,
+                &mut seen,
+                fallback.to_string(),
+                max_queries,
+            );
+        }
+    }
+
+    Ok(queries)
+}
+
+fn sample_file_ids(
+    connection: &Connection,
+    root_id_value: i64,
+    limit: usize,
+) -> CommandResult<Vec<i64>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+
+    let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
+    let mut statement = connection
+        .prepare(
+            "
+            SELECT id
+            FROM files
+            WHERE root_id = ?1
+            ORDER BY heading_count DESC, modified_ms DESC, id DESC
+            LIMIT ?2
+            ",
+        )
+        .map_err(|error| format!("Could not prepare benchmark file preview sample query: {error}"))?;
+    let rows = statement
+        .query_map(params![root_id_value, limit_i64], |row| row.get::<_, i64>(0))
+        .map_err(|error| format!("Could not run benchmark file preview sample query: {error}"))?;
+
+    let mut output = Vec::new();
+    for row in rows {
+        output.push(row.map_err(|error| format!("Could not parse sampled file id: {error}"))?);
+    }
+    Ok(output)
+}
+
+fn sample_heading_refs(
+    connection: &Connection,
+    root_id_value: i64,
+    limit: usize,
+) -> CommandResult<Vec<(i64, i64)>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+
+    let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
+    let mut statement = connection
+        .prepare(
+            "
+            SELECT h.file_id, h.heading_order
+            FROM headings h
+            JOIN files f ON f.id = h.file_id
+            WHERE f.root_id = ?1
+            ORDER BY f.heading_count DESC, h.heading_order ASC
+            LIMIT ?2
+            ",
+        )
+        .map_err(|error| {
+            format!("Could not prepare benchmark heading preview sample query: {error}")
+        })?;
+    let rows = statement
+        .query_map(params![root_id_value, limit_i64], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+        })
+        .map_err(|error| format!("Could not run benchmark heading preview sample query: {error}"))?;
+
+    let mut output = Vec::new();
+    for row in rows {
+        output.push(
+            row.map_err(|error| format!("Could not parse sampled heading reference: {error}"))?,
+        );
+    }
+    Ok(output)
+}
+
+#[tauri::command]
+pub(crate) async fn benchmark_root_performance(
+    app: AppHandle,
+    path: String,
+    queries: Option<Vec<String>>,
+    iterations: Option<usize>,
+    limit: Option<usize>,
+    include_semantic: Option<bool>,
+    preview_samples: Option<usize>,
+) -> CommandResult<BenchmarkReport> {
+    let benchmark_started = Instant::now();
+    let canonical_root = canonicalize_folder(&path)?;
+    let root_path = path_display(&canonical_root);
+
+    add_root(app.clone(), root_path.clone())?;
+    let index_full = index_root(app.clone(), root_path.clone())?;
+    let index_incremental = index_root(app.clone(), root_path.clone())?;
+
+    let connection = open_database(&app)?;
+    let root_id_value = root_id(&connection, &root_path)?.ok_or_else(|| {
+        format!(
+            "Benchmark root id missing for '{}'. Try indexing again.",
+            root_path
+        )
+    })?;
+
+    let benchmark_iterations = iterations.unwrap_or(3).clamp(1, 12);
+    let benchmark_limit = limit.unwrap_or(80).clamp(10, 400);
+    let benchmark_include_semantic = include_semantic.unwrap_or(true);
+    let benchmark_preview_samples = preview_samples.unwrap_or(16).clamp(0, 240);
+    let provided_queries = queries.unwrap_or_default();
+    let benchmark_queries =
+        collect_benchmark_queries(&connection, root_id_value, &provided_queries, 32)?;
+
+    let mut search = BenchmarkSearchSummary {
+        query_count: benchmark_queries.len(),
+        iterations: benchmark_iterations,
+        limit: benchmark_limit,
+        ..BenchmarkSearchSummary::default()
+    };
+
+    let mut lexical_raw_samples = Vec::new();
+    let mut lexical_raw_hits = 0_usize;
+    let mut lexical_raw_error: Option<String> = None;
+    'lexical_raw: for _ in 0..benchmark_iterations {
+        for query in &benchmark_queries {
+            let started = Instant::now();
+            match lexical::search(&app, query, Some(root_id_value), benchmark_limit, false) {
+                Ok(hits) => {
+                    lexical_raw_samples.push(elapsed_ms(started));
+                    lexical_raw_hits = lexical_raw_hits.saturating_add(hits.len());
+                }
+                Err(error) => {
+                    lexical_raw_error = Some(error);
+                    break 'lexical_raw;
+                }
+            }
+        }
+    }
+    search.lexical_raw = build_task_result(
+        true,
+        &lexical_raw_samples,
+        lexical_raw_hits,
+        lexical_raw_error,
+    );
+
+    query_engine::clear_query_cache();
+    for query in &benchmark_queries {
+        let _ = query_engine::search_lexical(
+            &app,
+            query,
+            Some(root_path.clone()),
+            Some(benchmark_limit),
+        );
+    }
+    let mut lexical_cached_samples = Vec::new();
+    let mut lexical_cached_hits = 0_usize;
+    let mut lexical_cached_error: Option<String> = None;
+    'lexical_cached: for _ in 0..benchmark_iterations {
+        for query in &benchmark_queries {
+            let started = Instant::now();
+            match query_engine::search_lexical(
+                &app,
+                query,
+                Some(root_path.clone()),
+                Some(benchmark_limit),
+            ) {
+                Ok(hits) => {
+                    lexical_cached_samples.push(elapsed_ms(started));
+                    lexical_cached_hits = lexical_cached_hits.saturating_add(hits.len());
+                }
+                Err(error) => {
+                    lexical_cached_error = Some(error);
+                    break 'lexical_cached;
+                }
+            }
+        }
+    }
+    search.lexical_cached = build_task_result(
+        true,
+        &lexical_cached_samples,
+        lexical_cached_hits,
+        lexical_cached_error,
+    );
+
+    if benchmark_include_semantic {
+        query_engine::clear_query_cache();
+        for query in &benchmark_queries {
+            let _ = query_engine::search_hybrid(
+                &app,
+                query,
+                Some(root_path.clone()),
+                Some(benchmark_limit),
+                false,
+                true,
+            )
+            .await;
+        }
+
+        let mut hybrid_samples = Vec::new();
+        let mut hybrid_hits = 0_usize;
+        let mut hybrid_error: Option<String> = None;
+        'hybrid: for _ in 0..benchmark_iterations {
+            for query in &benchmark_queries {
+                let started = Instant::now();
+                match query_engine::search_hybrid(
+                    &app,
+                    query,
+                    Some(root_path.clone()),
+                    Some(benchmark_limit),
+                    false,
+                    true,
+                )
+                .await
+                {
+                    Ok(hits) => {
+                        hybrid_samples.push(elapsed_ms(started));
+                        hybrid_hits = hybrid_hits.saturating_add(hits.len());
+                    }
+                    Err(error) => {
+                        hybrid_error = Some(error);
+                        break 'hybrid;
+                    }
+                }
+            }
+        }
+        search.hybrid = build_task_result(true, &hybrid_samples, hybrid_hits, hybrid_error);
+
+        let mut semantic_samples = Vec::new();
+        let mut semantic_hits = 0_usize;
+        let mut semantic_error: Option<String> = None;
+        if let Some(warm_query) = benchmark_queries.first() {
+            let _ = query_engine::search_semantic(
+                &app,
+                warm_query,
+                Some(root_path.clone()),
+                Some(benchmark_limit),
+            )
+            .await;
+        }
+        'semantic: for _ in 0..benchmark_iterations {
+            for query in &benchmark_queries {
+                let started = Instant::now();
+                match query_engine::search_semantic(
+                    &app,
+                    query,
+                    Some(root_path.clone()),
+                    Some(benchmark_limit),
+                )
+                .await
+                {
+                    Ok(hits) => {
+                        semantic_samples.push(elapsed_ms(started));
+                        semantic_hits = semantic_hits.saturating_add(hits.len());
+                    }
+                    Err(error) => {
+                        semantic_error = Some(error);
+                        break 'semantic;
+                    }
+                }
+            }
+        }
+        search.semantic = build_task_result(true, &semantic_samples, semantic_hits, semantic_error);
+    } else {
+        search.hybrid = build_task_result(false, &[], 0, None);
+        search.semantic = build_task_result(false, &[], 0, None);
+    }
+
+    let snapshot_started = Instant::now();
+    let _ = get_index_snapshot(app.clone(), root_path.clone())?;
+    let mut preview = BenchmarkPreviewSummary {
+        snapshot_ms: elapsed_ms(snapshot_started),
+        ..BenchmarkPreviewSummary::default()
+    };
+
+    let sampled_file_ids = sample_file_ids(&connection, root_id_value, benchmark_preview_samples)?;
+    let mut file_preview_samples = Vec::new();
+    let mut file_preview_hits = 0_usize;
+    let mut file_preview_error: Option<String> = None;
+    for file_id in sampled_file_ids {
+        let started = Instant::now();
+        match get_file_preview(app.clone(), file_id) {
+            Ok(file_preview) => {
+                file_preview_samples.push(elapsed_ms(started));
+                file_preview_hits =
+                    file_preview_hits.saturating_add(usize::try_from(file_preview.heading_count).unwrap_or(0));
+            }
+            Err(error) => {
+                file_preview_error = Some(error);
+                break;
+            }
+        }
+    }
+    preview.file_preview = build_task_result(
+        benchmark_preview_samples > 0,
+        &file_preview_samples,
+        file_preview_hits,
+        file_preview_error,
+    );
+
+    let sampled_heading_refs =
+        sample_heading_refs(&connection, root_id_value, benchmark_preview_samples)?;
+    let mut heading_preview_samples = Vec::new();
+    let mut heading_preview_hits = 0_usize;
+    let mut heading_preview_error: Option<String> = None;
+    for (file_id, heading_order) in sampled_heading_refs {
+        let started = Instant::now();
+        match get_heading_preview_html(app.clone(), file_id, heading_order) {
+            Ok(html) => {
+                heading_preview_samples.push(elapsed_ms(started));
+                if !html.trim().is_empty() {
+                    heading_preview_hits = heading_preview_hits.saturating_add(1);
+                }
+            }
+            Err(error) => {
+                heading_preview_error = Some(error);
+                break;
+            }
+        }
+    }
+    preview.heading_preview_html = build_task_result(
+        benchmark_preview_samples > 0,
+        &heading_preview_samples,
+        heading_preview_hits,
+        heading_preview_error,
+    );
+
+    Ok(BenchmarkReport {
+        root_path,
+        index_full,
+        index_incremental,
+        queries: benchmark_queries,
+        search,
+        preview,
+        generated_at_ms: now_ms(),
+        elapsed_ms: elapsed_ms(benchmark_started).round() as i64,
+    })
 }

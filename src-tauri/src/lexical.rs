@@ -3,14 +3,15 @@ use std::fs;
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
+use rusqlite::Connection;
 use tantivy::collector::TopDocs;
-use tantivy::query::QueryParser;
+use tantivy::query::{BooleanQuery, Occur, Query, QueryParser, TermQuery};
 use tantivy::schema::{
     Field, IndexRecordOption, NumericOptions, Schema, TextFieldIndexing, TextOptions, Value,
     STORED, STRING, TEXT,
 };
 use tantivy::tokenizer::{LowerCaser, NgramTokenizer, TextAnalyzer};
-use tantivy::{doc, Index, IndexReader, ReloadPolicy, TantivyDocument};
+use tantivy::{doc, Index, IndexReader, ReloadPolicy, TantivyDocument, Term};
 use tauri::AppHandle;
 
 use crate::db::index_lexical_dir;
@@ -23,6 +24,7 @@ const NGRAM_TOKENIZER: &str = "bf_ngram";
 const MIN_FETCH_MULTIPLIER: usize = 5;
 const MIN_FETCH_FLOOR: usize = 80;
 const MAX_FETCH_LIMIT: usize = 1_800;
+const CHUNK_PREVIEW_CHARS: usize = 240;
 
 #[derive(Clone)]
 pub(crate) struct LexicalDocument {
@@ -52,6 +54,7 @@ struct LexicalFields {
     heading_order: Field,
     author_text: Field,
     chunk_text: Field,
+    chunk_preview: Field,
     query_text: Field,
     prefix_text: Field,
     ngram_text: Field,
@@ -65,8 +68,8 @@ struct LexicalRuntime {
 
 static LEXICAL_RUNTIME: OnceLock<Mutex<LexicalRuntime>> = OnceLock::new();
 
-fn stored_text_options(tokenizer: &str) -> TextOptions {
-    TextOptions::default().set_stored().set_indexing_options(
+fn indexed_text_options(tokenizer: &str) -> TextOptions {
+    TextOptions::default().set_indexing_options(
         TextFieldIndexing::default()
             .set_tokenizer(tokenizer)
             .set_index_option(IndexRecordOption::WithFreqsAndPositions),
@@ -90,10 +93,11 @@ fn build_schema() -> Schema {
     builder.add_text_field("heading_text", TEXT | STORED);
     builder.add_i64_field("heading_order", numeric);
     builder.add_text_field("author_text", TEXT | STORED);
-    builder.add_text_field("chunk_text", TEXT | STORED);
-    builder.add_text_field("query_text", stored_text_options("default"));
-    builder.add_text_field("prefix_text", stored_text_options(PREFIX_TOKENIZER));
-    builder.add_text_field("ngram_text", stored_text_options(NGRAM_TOKENIZER));
+    builder.add_text_field("chunk_text", indexed_text_options("default"));
+    builder.add_text_field("chunk_preview", STORED);
+    builder.add_text_field("query_text", indexed_text_options("default"));
+    builder.add_text_field("prefix_text", indexed_text_options(PREFIX_TOKENIZER));
+    builder.add_text_field("ngram_text", indexed_text_options(NGRAM_TOKENIZER));
 
     builder.build()
 }
@@ -102,6 +106,7 @@ fn has_required_fields(schema: &Schema) -> bool {
     schema.get_field("query_text").is_ok()
         && schema.get_field("prefix_text").is_ok()
         && schema.get_field("ngram_text").is_ok()
+        && schema.get_field("chunk_preview").is_ok()
 }
 
 fn register_tokenizers(index: &Index) -> CommandResult<()> {
@@ -144,6 +149,7 @@ fn lexical_fields(schema: &Schema) -> CommandResult<LexicalFields> {
         heading_order: field(schema, "heading_order")?,
         author_text: field(schema, "author_text")?,
         chunk_text: field(schema, "chunk_text")?,
+        chunk_preview: field(schema, "chunk_preview")?,
         query_text: field(schema, "query_text")?,
         prefix_text: field(schema, "prefix_text")?,
         ngram_text: field(schema, "ngram_text")?,
@@ -254,15 +260,9 @@ fn build_hit(
     document: &TantivyDocument,
     fields: &LexicalFields,
     score: f64,
-    requested_root_id: Option<i64>,
     file_name_only: bool,
 ) -> Option<SearchHit> {
-    let root_id = i64::try_from(field_u64(document, fields.root_id)?).ok()?;
-    if let Some(requested) = requested_root_id {
-        if requested != root_id {
-            return None;
-        }
-    }
+    let _root_id = i64::try_from(field_u64(document, fields.root_id)?).ok()?;
 
     let file_id = i64::try_from(field_u64(document, fields.file_id)?).ok()?;
     let kind = field_text(document, fields.kind).unwrap_or_else(|| "file".to_string());
@@ -276,16 +276,7 @@ fn build_hit(
     let heading_order = field_i64(document, fields.heading_order);
     let heading_text = field_text(document, fields.heading_text)
         .or_else(|| field_text(document, fields.author_text))
-        .or_else(|| {
-            field_text(document, fields.chunk_text).map(|value| {
-                let trimmed = value.trim();
-                if trimmed.chars().count() > 180 {
-                    trimmed.chars().take(180).collect::<String>()
-                } else {
-                    trimmed.to_string()
-                }
-            })
-        });
+        .or_else(|| field_text(document, fields.chunk_preview));
 
     let mapped_kind = if kind == "author" {
         "author".to_string()
@@ -309,9 +300,83 @@ fn build_hit(
     })
 }
 
-pub(crate) fn replace_all_documents(
+fn preview_text_for_chunk(chunk_text: &str) -> String {
+    let trimmed = chunk_text.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    if trimmed.chars().count() <= CHUNK_PREVIEW_CHARS {
+        return trimmed.to_string();
+    }
+    trimmed
+        .chars()
+        .take(CHUNK_PREVIEW_CHARS)
+        .collect::<String>()
+}
+
+fn add_document_to_writer(
+    writer: &mut tantivy::IndexWriter,
+    fields: &LexicalFields,
+    entry: &LexicalDocument,
+) -> CommandResult<()> {
+    let heading_text = entry.heading_text.clone().unwrap_or_default();
+    let author_text = entry.author_text.clone().unwrap_or_default();
+    let chunk_text = entry.chunk_text.clone().unwrap_or_default();
+    let chunk_preview = preview_text_for_chunk(&chunk_text);
+    let query_text = format!(
+        "{}\n{}\n{}\n{}",
+        heading_text, author_text, entry.file_name, entry.relative_path
+    );
+    let prefix_text = format!(
+        "{} {} {} {}",
+        heading_text, author_text, entry.file_name, entry.relative_path
+    );
+    let ngram_text = format!(
+        "{} {} {} {} {}",
+        heading_text, author_text, chunk_preview, entry.file_name, entry.relative_path
+    );
+
+    let mut document = doc!(
+        fields.kind => entry.kind.as_str(),
+        fields.root_id => u64::try_from(entry.root_id).unwrap_or(0),
+        fields.file_id => u64::try_from(entry.file_id).unwrap_or(0),
+        fields.file_name => entry.file_name.as_str(),
+        fields.relative_path => entry.relative_path.as_str(),
+        fields.absolute_path => entry.absolute_path.as_str(),
+        fields.query_text => query_text,
+        fields.prefix_text => prefix_text,
+        fields.ngram_text => ngram_text,
+    );
+
+    if let Some(level) = entry.heading_level {
+        document.add_i64(fields.heading_level, level);
+    }
+    if let Some(order) = entry.heading_order {
+        document.add_i64(fields.heading_order, order);
+    }
+    if !heading_text.is_empty() {
+        document.add_text(fields.heading_text, heading_text);
+    }
+    if !author_text.is_empty() {
+        document.add_text(fields.author_text, author_text);
+    }
+    if !chunk_text.is_empty() {
+        document.add_text(fields.chunk_text, chunk_text);
+        document.add_text(fields.chunk_preview, chunk_preview);
+    }
+
+    writer.add_document(document).map_err(|error| {
+        format!(
+            "Could not add lexical document for '{}': {error}",
+            entry.relative_path
+        )
+    })?;
+    Ok(())
+}
+
+pub(crate) fn replace_all_documents_from_connection(
     app: &AppHandle,
-    documents: &[LexicalDocument],
+    connection: &Connection,
 ) -> CommandResult<()> {
     let runtime = lexical_runtime(app)?;
     let runtime = runtime
@@ -320,62 +385,238 @@ pub(crate) fn replace_all_documents(
 
     let mut writer = runtime
         .index
-        .writer(96_000_000)
+        .writer(256_000_000)
         .map_err(|error| format!("Could not create lexical index writer: {error}"))?;
 
     writer
         .delete_all_documents()
         .map_err(|error| format!("Could not clear lexical index: {error}"))?;
 
-    for entry in documents {
-        let heading_text = entry.heading_text.clone().unwrap_or_default();
-        let author_text = entry.author_text.clone().unwrap_or_default();
-        let chunk_text = entry.chunk_text.clone().unwrap_or_default();
-        let query_text = format!(
-            "{}\n{}\n{}\n{}\n{}",
-            heading_text, author_text, chunk_text, entry.file_name, entry.relative_path
-        );
-        let prefix_text = format!(
-            "{} {} {} {}",
-            heading_text, author_text, entry.file_name, entry.relative_path
-        );
-        let ngram_text = format!(
-            "{} {} {} {} {}",
-            heading_text, author_text, chunk_text, entry.file_name, entry.relative_path
-        );
-
-        let mut document = doc!(
-            runtime.fields.kind => entry.kind.as_str(),
-            runtime.fields.root_id => u64::try_from(entry.root_id).unwrap_or(0),
-            runtime.fields.file_id => u64::try_from(entry.file_id).unwrap_or(0),
-            runtime.fields.file_name => entry.file_name.as_str(),
-            runtime.fields.relative_path => entry.relative_path.as_str(),
-            runtime.fields.absolute_path => entry.absolute_path.as_str(),
-            runtime.fields.query_text => query_text,
-            runtime.fields.prefix_text => prefix_text,
-            runtime.fields.ngram_text => ngram_text,
-            runtime.fields.chunk_text => chunk_text,
-        );
-
-        if let Some(level) = entry.heading_level {
-            document.add_i64(runtime.fields.heading_level, level);
-        }
-        if let Some(order) = entry.heading_order {
-            document.add_i64(runtime.fields.heading_order, order);
-        }
-        if !heading_text.is_empty() {
-            document.add_text(runtime.fields.heading_text, heading_text);
-        }
-        if !author_text.is_empty() {
-            document.add_text(runtime.fields.author_text, author_text);
-        }
-
-        writer.add_document(document).map_err(|error| {
-            format!(
-                "Could not add lexical document for '{}': {error}",
-                entry.relative_path
+    {
+        let mut statement = connection
+            .prepare(
+                "
+                SELECT root_id, id, relative_path, absolute_path
+                FROM files
+                ORDER BY root_id ASC, relative_path ASC
+                ",
             )
-        })?;
+            .map_err(|error| format!("Could not prepare lexical file rows query: {error}"))?;
+
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })
+            .map_err(|error| format!("Could not read lexical file rows: {error}"))?;
+
+        for row in rows {
+            let (root_id, file_id, relative_path, absolute_path) =
+                row.map_err(|error| format!("Could not parse lexical file row: {error}"))?;
+            let file_name = crate::util::file_name_from_relative(&relative_path);
+            let entry = LexicalDocument {
+                root_id,
+                file_id,
+                kind: "file".to_string(),
+                file_name,
+                relative_path,
+                absolute_path,
+                heading_level: None,
+                heading_text: None,
+                heading_order: None,
+                author_text: None,
+                chunk_text: None,
+            };
+            add_document_to_writer(&mut writer, &runtime.fields, &entry)?;
+        }
+    }
+
+    {
+        let mut statement = connection
+            .prepare(
+                "
+                SELECT
+                  f.root_id,
+                  f.id,
+                  f.relative_path,
+                  f.absolute_path,
+                  h.level,
+                  h.text,
+                  h.heading_order
+                FROM headings h
+                JOIN files f ON f.id = h.file_id
+                ORDER BY f.root_id ASC, f.id ASC, h.heading_order ASC
+                ",
+            )
+            .map_err(|error| format!("Could not prepare lexical heading rows query: {error}"))?;
+
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, i64>(6)?,
+                ))
+            })
+            .map_err(|error| format!("Could not read lexical heading rows: {error}"))?;
+
+        for row in rows {
+            let (
+                root_id,
+                file_id,
+                relative_path,
+                absolute_path,
+                level,
+                heading_text,
+                heading_order,
+            ) = row.map_err(|error| format!("Could not parse lexical heading row: {error}"))?;
+            let file_name = crate::util::file_name_from_relative(&relative_path);
+            let entry = LexicalDocument {
+                root_id,
+                file_id,
+                kind: "heading".to_string(),
+                file_name,
+                relative_path,
+                absolute_path,
+                heading_level: Some(level),
+                heading_text: Some(heading_text),
+                heading_order: Some(heading_order),
+                author_text: None,
+                chunk_text: None,
+            };
+            add_document_to_writer(&mut writer, &runtime.fields, &entry)?;
+        }
+    }
+
+    {
+        let mut statement = connection
+            .prepare(
+                "
+                SELECT
+                  f.root_id,
+                  f.id,
+                  f.relative_path,
+                  f.absolute_path,
+                  a.text,
+                  a.author_order
+                FROM authors a
+                JOIN files f ON f.id = a.file_id
+                ORDER BY f.root_id ASC, f.id ASC, a.author_order ASC
+                ",
+            )
+            .map_err(|error| format!("Could not prepare lexical author rows query: {error}"))?;
+
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            })
+            .map_err(|error| format!("Could not read lexical author rows: {error}"))?;
+
+        for row in rows {
+            let (root_id, file_id, relative_path, absolute_path, author_text, author_order) =
+                row.map_err(|error| format!("Could not parse lexical author row: {error}"))?;
+            let file_name = crate::util::file_name_from_relative(&relative_path);
+            let entry = LexicalDocument {
+                root_id,
+                file_id,
+                kind: "author".to_string(),
+                file_name,
+                relative_path,
+                absolute_path,
+                heading_level: None,
+                heading_text: Some(author_text.clone()),
+                heading_order: Some(author_order),
+                author_text: Some(author_text),
+                chunk_text: None,
+            };
+            add_document_to_writer(&mut writer, &runtime.fields, &entry)?;
+        }
+    }
+
+    {
+        let mut statement = connection
+            .prepare(
+                "
+                SELECT
+                  root_id,
+                  file_id,
+                  relative_path,
+                  absolute_path,
+                  heading_level,
+                  heading_text,
+                  heading_order,
+                  author_text,
+                  chunk_text
+                FROM chunks
+                ORDER BY root_id ASC, file_id ASC, chunk_order ASC
+                ",
+            )
+            .map_err(|error| format!("Could not prepare lexical chunk rows query: {error}"))?;
+
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<i64>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, String>(8)?,
+                ))
+            })
+            .map_err(|error| format!("Could not read lexical chunk rows: {error}"))?;
+
+        for row in rows {
+            let (
+                root_id,
+                file_id,
+                relative_path,
+                absolute_path,
+                heading_level,
+                heading_text,
+                heading_order,
+                author_text,
+                chunk_text,
+            ) = row.map_err(|error| format!("Could not parse lexical chunk row: {error}"))?;
+
+            if chunk_text.trim().is_empty() {
+                continue;
+            }
+
+            let file_name = crate::util::file_name_from_relative(&relative_path);
+            let entry = LexicalDocument {
+                root_id,
+                file_id,
+                kind: "chunk".to_string(),
+                file_name,
+                relative_path,
+                absolute_path,
+                heading_level,
+                heading_text,
+                heading_order,
+                author_text,
+                chunk_text: Some(chunk_text),
+            };
+            add_document_to_writer(&mut writer, &runtime.fields, &entry)?;
+        }
     }
 
     writer
@@ -455,8 +696,23 @@ pub(crate) fn search(
             Ok(parsed) => parsed,
             Err(_) => return Ok(Vec::new()),
         };
+        let query: Box<dyn Query> = if let Some(root_id) = requested_root_id {
+            let Ok(root_id_u64) = u64::try_from(root_id) else {
+                return Ok(Vec::new());
+            };
+            let root_term = Term::from_field_u64(runtime.fields.root_id, root_id_u64);
+            let root_query: Box<dyn Query> =
+                Box::new(TermQuery::new(root_term, IndexRecordOption::Basic));
+            Box::new(BooleanQuery::new(vec![
+                (Occur::Must, parsed),
+                (Occur::Must, root_query),
+            ]))
+        } else {
+            parsed
+        };
+
         let docs = searcher
-            .search(&parsed, &TopDocs::with_limit(fetch_limit))
+            .search(&query, &TopDocs::with_limit(fetch_limit))
             .map_err(|error| format!("Lexical search execution failed: {error}"))?;
         let mut output = Vec::with_capacity(docs.len());
         for (_score, address) in docs {
@@ -500,13 +756,7 @@ pub(crate) fn search(
                 break;
             }
             let score = score_base + f64::from(rank as u32);
-            let Some(hit) = build_hit(
-                &document,
-                &runtime.fields,
-                score,
-                requested_root_id,
-                file_name_only,
-            ) else {
+            let Some(hit) = build_hit(&document, &runtime.fields, score, file_name_only) else {
                 continue;
             };
             let key = dedupe_key(&hit);

@@ -656,7 +656,12 @@ async fn rebuild_semantic_index(app: AppHandle, force: bool) -> CommandResult<()
             .iter()
             .map(|candidate| candidate.semantic_text.clone())
             .collect::<Vec<String>>();
-        let embeddings = embed_semantic_texts(&app, &texts)?;
+        let app_for_embedding = app.clone();
+        let embeddings = tauri::async_runtime::spawn_blocking(move || {
+            embed_semantic_texts(&app_for_embedding, &texts)
+        })
+        .await
+        .map_err(|error| format!("Semantic embedding task failed: {error}"))??;
         if embeddings.is_empty() {
             continue;
         }
@@ -851,7 +856,13 @@ pub(crate) async fn semantic_search(
         Err(_) => return Ok(Vec::new()),
     };
 
-    let query_embedding = embed_semantic_texts(app, &[query.to_string()])?;
+    let app_for_embedding = app.clone();
+    let query_text = query.to_string();
+    let query_embedding = tauri::async_runtime::spawn_blocking(move || {
+        embed_semantic_texts(&app_for_embedding, &[query_text])
+    })
+    .await
+    .map_err(|error| format!("Semantic query embedding task failed: {error}"))??;
     if query_embedding.is_empty() || query_embedding[0].is_empty() {
         return Ok(Vec::new());
     }

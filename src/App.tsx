@@ -1,7 +1,7 @@
 import { open } from "@tauri-apps/plugin-dialog";
 import { openPath } from "@tauri-apps/plugin-opener";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { batch, createEffect, createMemo, createSignal, onCleanup, onMount, untrack } from "solid-js";
+import { batch, createEffect, createMemo, createSignal, onCleanup, onMount, startTransition, untrack } from "solid-js";
 import CaptureTargetPanel from "./components/CaptureTargetPanel.tsx";
 import SidePreviewPane from "./components/SidePreviewPane.tsx";
 import TopControls from "./components/TopControls.tsx";
@@ -36,6 +36,8 @@ import { buildSnapshotIndex, buildTreeRows } from "./lib/treeRows";
 function App() {
   const LEFT_RAIL_DEFAULT_PX = 560;
   const LEFT_RAIL_MIN_PX = 420;
+  const TREE_PANEL_MIN_PX = 360;
+  const PANEL_HANDLE_WIDTH_PX = 12;
   const CAPTURE_TARGET_PREFS_KEY = "blockfile.captureTargetsByRoot.v1";
 
   const [roots, setRoots] = createSignal<RootSummary[]>([]);
@@ -77,6 +79,10 @@ function App() {
   const [previewPanelWidthPx, setPreviewPanelWidthPx] = createSignal(420);
   const PREVIEW_PANEL_MIN_PX = 280;
   const PREVIEW_PANEL_MAX_PX = 640;
+  const PREVIEW_WARMUP_LIMIT = 24;
+  const PREVIEW_WARMUP_BATCH_SIZE = 2;
+  const PREVIEW_WARMUP_DELAY_MS = 40;
+  const PREVIEW_CACHE_FLUSH_MS = 16;
 
   let treeRef: HTMLDivElement | undefined;
   let searchRequestSeq = 0;
@@ -89,8 +95,11 @@ function App() {
   let stopIndexProgressListener: UnlistenFn | null = null;
   let searchInputRef: HTMLInputElement | undefined;
   let headingPreviewTimer = 0;
+  let previewCacheFlushTimer = 0;
   let pendingFocusDelta = 0;
   let focusMoveFrame = 0;
+  const previewLoadsInFlight = new Map<number, Promise<FilePreview>>();
+  const pendingPreviewCacheUpdates = new Map<number, FilePreview>();
 
   const selectedRoot = createMemo(() => roots().find((root) => root.path === selectedRootPath()) ?? null);
   const isAllRootsSelected = createMemo(() => selectedRootPath() === ALL_ROOTS_KEY);
@@ -213,13 +222,51 @@ function App() {
     setTimeout(() => setCopyToast(""), 1000);
   };
 
+  const flushPendingPreviewCache = () => {
+    previewCacheFlushTimer = 0;
+    if (pendingPreviewCacheUpdates.size === 0) return;
+
+    const updates = Array.from(pendingPreviewCacheUpdates.entries());
+    pendingPreviewCacheUpdates.clear();
+    startTransition(() => {
+      setPreviewCache((current) => {
+        let changed = false;
+        const next = { ...current };
+        for (const [fileId, preview] of updates) {
+          if (next[fileId] !== preview) {
+            next[fileId] = preview;
+            changed = true;
+          }
+        }
+        return changed ? next : current;
+      });
+    });
+  };
+
+  const queuePreviewCacheUpdate = (preview: FilePreview) => {
+    pendingPreviewCacheUpdates.set(preview.fileId, preview);
+    if (previewCacheFlushTimer) return;
+    previewCacheFlushTimer = window.setTimeout(flushPendingPreviewCache, PREVIEW_CACHE_FLUSH_MS);
+  };
+
   const ensurePreviewLoaded = async (fileId: number) => {
-    const cached = previewCache()[fileId];
+    const cached = untrack(() => previewCache()[fileId]);
     if (cached) return cached;
 
-    const preview = await invokeTyped<FilePreview>("get_file_preview", { fileId });
-    setPreviewCache((current) => ({ ...current, [fileId]: preview }));
-    return preview;
+    const inFlight = previewLoadsInFlight.get(fileId);
+    if (inFlight) return inFlight;
+
+    const loading = invokeTyped<FilePreview>("get_file_preview", { fileId })
+      .then((preview) => {
+        queuePreviewCacheUpdate(preview);
+        return preview;
+      })
+      .finally(() => {
+        previewLoadsInFlight.delete(fileId);
+      });
+
+    previewLoadsInFlight.set(fileId, loading);
+    return loading;
   };
 
   const expandFolderAncestors = (folderPath: string) => {
@@ -396,19 +443,51 @@ function App() {
 
   let stopPreviewPanelResize: (() => void) | null = null;
 
+  const clamp = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value));
+
+  const computePreviewWidthMax = () => {
+    if (!showPreviewPanel()) return PREVIEW_PANEL_MAX_PX;
+    const handleCount = (showCapturePanel() ? 1 : 0) + 1;
+    const reservedLeft = showCapturePanel() ? LEFT_RAIL_MIN_PX : 0;
+    const maxByLayout = window.innerWidth - TREE_PANEL_MIN_PX - reservedLeft - handleCount * PANEL_HANDLE_WIDTH_PX;
+    return Math.max(PREVIEW_PANEL_MIN_PX, Math.min(PREVIEW_PANEL_MAX_PX, maxByLayout));
+  };
+
+  const computeLeftRailWidthMax = (previewWidth: number) => {
+    if (!showCapturePanel()) return LEFT_RAIL_MIN_PX;
+    const handleCount = (showCapturePanel() ? 1 : 0) + (showPreviewPanel() ? 1 : 0);
+    const reservedPreview = showPreviewPanel() ? Math.max(PREVIEW_PANEL_MIN_PX, previewWidth) : 0;
+    const maxByLayout = window.innerWidth - TREE_PANEL_MIN_PX - reservedPreview - handleCount * PANEL_HANDLE_WIDTH_PX;
+    return Math.max(LEFT_RAIL_MIN_PX, maxByLayout);
+  };
+
+  const constrainPanelWidths = () => {
+    const nextPreviewWidth = showPreviewPanel()
+      ? clamp(previewPanelWidthPx(), PREVIEW_PANEL_MIN_PX, computePreviewWidthMax())
+      : previewPanelWidthPx();
+
+    if (showPreviewPanel() && nextPreviewWidth !== previewPanelWidthPx()) {
+      setPreviewPanelWidthPx(nextPreviewWidth);
+    }
+
+    if (!showCapturePanel()) return;
+
+    const nextLeftWidth = clamp(leftRailWidthPx(), LEFT_RAIL_MIN_PX, computeLeftRailWidthMax(nextPreviewWidth));
+    if (nextLeftWidth !== leftRailWidthPx()) {
+      setLeftRailWidthPx(nextLeftWidth);
+    }
+  };
+
   const startLeftRailResize = (event: MouseEvent) => {
     if (window.innerWidth < 1024) return;
     event.preventDefault();
 
     const startX = event.clientX;
     const initialWidth = leftRailWidthPx();
-    const maxWidth = Math.max(LEFT_RAIL_MIN_PX, window.innerWidth - 520);
 
     const onMouseMove = (moveEvent: MouseEvent) => {
-      const nextWidth = Math.min(
-        maxWidth,
-        Math.max(LEFT_RAIL_MIN_PX, initialWidth + (moveEvent.clientX - startX)),
-      );
+      const maxWidth = computeLeftRailWidthMax(previewPanelWidthPx());
+      const nextWidth = clamp(initialWidth + (moveEvent.clientX - startX), LEFT_RAIL_MIN_PX, maxWidth);
       setLeftRailWidthPx(nextWidth);
     };
 
@@ -435,10 +514,14 @@ function App() {
 
     const onMouseMove = (moveEvent: MouseEvent) => {
       const delta = startX - moveEvent.clientX;
-      const nextWidth = Math.min(
-        PREVIEW_PANEL_MAX_PX,
-        Math.max(PREVIEW_PANEL_MIN_PX, initialWidth + delta),
-      );
+      const maxPreviewWidth = computePreviewWidthMax();
+      const nextWidth = clamp(initialWidth + delta, PREVIEW_PANEL_MIN_PX, maxPreviewWidth);
+
+      if (showCapturePanel()) {
+        const allowedLeftWidth = computeLeftRailWidthMax(nextWidth);
+        setLeftRailWidthPx((current) => Math.min(current, allowedLeftWidth));
+      }
+
       setPreviewPanelWidthPx(nextWidth);
     };
 
@@ -457,8 +540,15 @@ function App() {
     stopPreviewPanelResize = onMouseUp;
   };
 
-  const toggleCapturePanel = () => setShowCapturePanel(prev => !prev);
-  const togglePreviewPanel = () => setShowPreviewPanel(prev => !prev);
+  const toggleCapturePanel = () => {
+    setShowCapturePanel((prev) => !prev);
+    requestAnimationFrame(constrainPanelWidths);
+  };
+
+  const togglePreviewPanel = () => {
+    setShowPreviewPanel((prev) => !prev);
+    requestAnimationFrame(constrainPanelWidths);
+  };
 
   const loadRoots = async () => {
     const loaded = await invokeTyped<RootSummary[]>("list_roots");
@@ -723,6 +813,57 @@ function App() {
       if (requestId === capturePreviewSeq) {
         setStatus(`Could not move heading: ${String(error)}`);
       }
+    } finally {
+      if (requestId === capturePreviewSeq) {
+        setIsLoadingCapturePreview(false);
+      }
+    }
+  };
+
+  const addCaptureHeading = async (headingLevel: 1 | 2 | 3 | 4, headingName: string): Promise<boolean> => {
+    const rootPath = captureRootPath();
+    const targetPath = selectedCaptureTarget();
+    if (!rootPath || !targetPath) {
+      setStatus("Select a destination docx file first.");
+      return false;
+    }
+
+    const headingText = headingName.trim();
+    if (!headingText) {
+      setStatus("Heading name cannot be empty.");
+      return false;
+    }
+
+    const requestId = ++capturePreviewSeq;
+    setIsLoadingCapturePreview(true);
+    try {
+      const preview = await invokeTyped<CaptureTargetPreview>("add_capture_heading", {
+        rootPath,
+        targetPath,
+        headingLevel,
+        headingText,
+        selectedTargetHeadingOrder: selectedCaptureHeadingOrder(),
+      });
+      if (requestId !== capturePreviewSeq) return false;
+
+      const insertedHeading = [...preview.headings]
+        .reverse()
+        .find((heading) => heading.level === headingLevel && heading.text === headingText);
+
+      batch(() => {
+        setCaptureTargetPreview(preview);
+        if (insertedHeading) {
+          setSelectedCaptureHeadingOrder(insertedHeading.order);
+        }
+      });
+
+      setStatus(`Added H${headingLevel} \"${headingText}\" in ${basename(preview.absolutePath)}`);
+      return true;
+    } catch (error) {
+      if (requestId === capturePreviewSeq) {
+        setStatus(`Could not add heading: ${String(error)}`);
+      }
+      return false;
     } finally {
       if (requestId === capturePreviewSeq) {
         setIsLoadingCapturePreview(false);
@@ -1225,7 +1366,8 @@ function App() {
 
   createEffect(() => {
     treeRows().length;
-    queueMicrotask(syncTreeViewportState);
+    const frame = requestAnimationFrame(() => syncTreeViewportState());
+    onCleanup(() => cancelAnimationFrame(frame));
   });
 
   createEffect(() => {
@@ -1259,7 +1401,9 @@ function App() {
         })
         .then((results) => {
           if (requestId === searchRequestSeq) {
-            setSearchResults(results);
+            startTransition(() => {
+              setSearchResults(results);
+            });
           }
         })
         .finally(() => {
@@ -1283,7 +1427,7 @@ function App() {
 
   createEffect(() => {
     if (!searchMode()) return;
-    const ids = Array.from(new Set(searchResults().map((result) => result.fileId))).slice(0, 48);
+    const ids = Array.from(new Set(searchResults().map((result) => result.fileId))).slice(0, PREVIEW_WARMUP_LIMIT);
     if (ids.length === 0) return;
 
     const requestId = ++previewWarmupSeq;
@@ -1294,21 +1438,14 @@ function App() {
     const loadBatch = async (batchIds: number[]) => {
       await Promise.allSettled(batchIds.map((id) => ensurePreviewLoaded(id)));
     };
+    const pause = () => new Promise<void>((resolve) => setTimeout(resolve, PREVIEW_WARMUP_DELAY_MS));
 
     void (async () => {
-      const immediate = missing.slice(0, 12);
-      const deferred = missing.slice(12);
-
-      for (let index = 0; index < immediate.length; index += 4) {
+      for (let index = 0; index < missing.length; index += PREVIEW_WARMUP_BATCH_SIZE) {
         if (requestId !== previewWarmupSeq) return;
-        await loadBatch(immediate.slice(index, index + 4));
-      }
-
-      for (let index = 0; index < deferred.length; index += 4) {
+        await loadBatch(missing.slice(index, index + PREVIEW_WARMUP_BATCH_SIZE));
         if (requestId !== previewWarmupSeq) return;
-        await new Promise<void>((resolve) => setTimeout(resolve, 48));
-        if (requestId !== previewWarmupSeq) return;
-        await loadBatch(deferred.slice(index, index + 4));
+        await pause();
       }
     })();
   });
@@ -1327,8 +1464,17 @@ function App() {
     });
   });
 
+  createEffect(() => {
+    showCapturePanel();
+    showPreviewPanel();
+    requestAnimationFrame(constrainPanelWidths);
+  });
+
   onMount(() => {
-    const onResize = () => syncTreeViewportState();
+    const onResize = () => {
+      constrainPanelWidths();
+      syncTreeViewportState();
+    };
     const onGlobalKeyDown = (event: KeyboardEvent) => {
       const key = event.key;
 
@@ -1409,6 +1555,10 @@ function App() {
         window.clearTimeout(headingPreviewTimer);
         headingPreviewTimer = 0;
       }
+      if (previewCacheFlushTimer) {
+        window.clearTimeout(previewCacheFlushTimer);
+        previewCacheFlushTimer = 0;
+      }
       if (focusMoveFrame) {
         cancelAnimationFrame(focusMoveFrame);
         focusMoveFrame = 0;
@@ -1460,10 +1610,11 @@ function App() {
         />
 
         <div class="flex min-h-0 flex-1">
-          <div class="workspace-split h-full min-h-0 flex-1" style={{ "--left-rail-width": showCapturePanel() ? `${leftRailWidthPx()}px` : '0px' }}>
+          <div class="workspace-split h-full min-h-0 min-w-0 flex-1" style={{ "--left-rail-width": showCapturePanel() ? `${leftRailWidthPx()}px` : '0px' }}>
             {showCapturePanel() && (
               <aside class="h-full min-h-0 border-r border-neutral-800/50 bg-neutral-950/30 flex flex-col">
                 <CaptureTargetPanel
+                  addCaptureHeading={addCaptureHeading}
                   captureRootPath={captureRootPath}
                   captureTargetH1ToH4={captureTargetH1ToH4}
                   captureTargetPreview={captureTargetPreview}
@@ -1494,7 +1645,7 @@ function App() {
               />
             )}
 
-            <div class="h-full min-h-0 flex-1 bg-neutral-950/20">
+            <div class="h-full min-h-0 min-w-0 flex-1 bg-neutral-950/20">
               <TreeView
                 activateRow={activateRow}
                 applyPreviewFromRow={applyPreviewFromRow}
@@ -1522,12 +1673,15 @@ function App() {
             <>
               <button
                 aria-label="Resize preview panel"
-                class="panel-resize-handle hidden lg:flex"
+                class="panel-resize-handle flex"
                 onMouseDown={startPreviewPanelResize}
                 title="Drag to resize preview"
                 type="button"
               />
-              <SidePreviewPane sidePreview={sidePreview} width={previewPanelWidthPx} />
+              <SidePreviewPane
+                sidePreview={sidePreview}
+                width={previewPanelWidthPx}
+              />
             </>
           )}
         </div>

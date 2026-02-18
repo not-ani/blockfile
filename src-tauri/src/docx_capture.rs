@@ -45,6 +45,15 @@ pub(crate) fn paragraph_xml_bold(text: &str) -> String {
     )
 }
 
+pub(crate) fn paragraph_xml_heading(level: i64, text: &str) -> String {
+    let style_id = format!("Heading{}", level);
+    format!(
+        "<w:p><w:pPr><w:pStyle w:val=\"{}\"/></w:pPr><w:r><w:t xml:space=\"preserve\">{}</w:t></w:r></w:p>",
+        xml_escape_attr(&style_id),
+        xml_escape_text(text)
+    )
+}
+
 pub(crate) fn fallback_styled_section(content: &str) -> StyledSection {
     let mut paragraph_xml = content
         .split('\n')

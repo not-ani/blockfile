@@ -239,6 +239,59 @@ pub(crate) struct IndexProgress {
     pub current_file: Option<String>,
 }
 
+#[derive(Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct BenchmarkLatencyStats {
+    pub runs: usize,
+    pub min_ms: f64,
+    pub p50_ms: f64,
+    pub p95_ms: f64,
+    pub max_ms: f64,
+    pub mean_ms: f64,
+}
+
+#[derive(Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct BenchmarkTaskResult {
+    pub enabled: bool,
+    pub error: Option<String>,
+    pub total_hits: usize,
+    pub latency: BenchmarkLatencyStats,
+}
+
+#[derive(Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct BenchmarkSearchSummary {
+    pub query_count: usize,
+    pub iterations: usize,
+    pub limit: usize,
+    pub lexical_raw: BenchmarkTaskResult,
+    pub lexical_cached: BenchmarkTaskResult,
+    pub hybrid: BenchmarkTaskResult,
+    pub semantic: BenchmarkTaskResult,
+}
+
+#[derive(Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct BenchmarkPreviewSummary {
+    pub snapshot_ms: f64,
+    pub file_preview: BenchmarkTaskResult,
+    pub heading_preview_html: BenchmarkTaskResult,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct BenchmarkReport {
+    pub root_path: String,
+    pub index_full: IndexStats,
+    pub index_incremental: IndexStats,
+    pub queries: Vec<String>,
+    pub search: BenchmarkSearchSummary,
+    pub preview: BenchmarkPreviewSummary,
+    pub generated_at_ms: i64,
+    pub elapsed_ms: i64,
+}
+
 pub(crate) struct StyledSection {
     pub paragraph_xml: Vec<String>,
     pub style_ids: HashSet<String>,

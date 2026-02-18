@@ -105,6 +105,9 @@
   .panel-resize-handle {
     @apply relative items-stretch justify-center border-0 bg-transparent p-0;
     cursor: col-resize;
+    width: 12px;
+    min-width: 12px;
+    touch-action: none;
   }
 
   .panel-resize-handle::before {

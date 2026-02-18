@@ -10,10 +10,72 @@ import {
   basename,
   f8RowKey,
   folderAncestors,
-  headingChainForTarget,
   headingLevelLabel,
   headingRowKey,
 } from "./utils";
+
+type PreparedPreview = {
+  orderedHeadings: FilePreview["headings"];
+  depthByHeadingIndex: number[];
+  hasChildrenByHeadingIndex: boolean[];
+  chainByHeadingOrder: Map<number, FilePreview["headings"]>;
+  headingByOrder: Map<number, FilePreview["headings"][number]>;
+  headingByLevelAndText: Map<string, FilePreview["headings"][number]>;
+};
+
+const previewLayoutCache = new WeakMap<FilePreview, PreparedPreview>();
+
+const headingLookupKey = (level: number, text: string) => `${level}:${text}`;
+
+const preparePreview = (preview: FilePreview): PreparedPreview => {
+  const cached = previewLayoutCache.get(preview);
+  if (cached) return cached;
+
+  const orderedHeadings = [...preview.headings].sort((left, right) => left.order - right.order);
+  const depthByHeadingIndex = new Array<number>(orderedHeadings.length).fill(0);
+  const hasChildrenByHeadingIndex = new Array<boolean>(orderedHeadings.length).fill(false);
+  const chainByHeadingOrder = new Map<number, FilePreview["headings"]>();
+  const headingByOrder = new Map<number, FilePreview["headings"][number]>();
+  const headingByLevelAndText = new Map<string, FilePreview["headings"][number]>();
+
+  const indexStack: number[] = [];
+  const headingStack: FilePreview["headings"] = [];
+
+  for (let index = 0; index < orderedHeadings.length; index += 1) {
+    const currentHeading = orderedHeadings[index];
+    while (indexStack.length > 0 && orderedHeadings[indexStack[indexStack.length - 1]].level >= currentHeading.level) {
+      indexStack.pop();
+      headingStack.pop();
+    }
+
+    depthByHeadingIndex[index] = indexStack.length;
+    if (indexStack.length > 0) {
+      hasChildrenByHeadingIndex[indexStack[indexStack.length - 1]] = true;
+    }
+
+    indexStack.push(index);
+    headingStack.push(currentHeading);
+
+    chainByHeadingOrder.set(currentHeading.order, [...headingStack]);
+    headingByOrder.set(currentHeading.order, currentHeading);
+    const lookup = headingLookupKey(currentHeading.level, currentHeading.text);
+    if (!headingByLevelAndText.has(lookup)) {
+      headingByLevelAndText.set(lookup, currentHeading);
+    }
+  }
+
+  const prepared: PreparedPreview = {
+    orderedHeadings,
+    depthByHeadingIndex,
+    hasChildrenByHeadingIndex,
+    chainByHeadingOrder,
+    headingByOrder,
+    headingByLevelAndText,
+  };
+
+  previewLayoutCache.set(preview, prepared);
+  return prepared;
+};
 
 type SnapshotIndex = {
   snap: IndexSnapshot;
@@ -91,6 +153,8 @@ export const buildTreeRows = (args: BuildTreeRowsArgs): TreeRow[] => {
   if (searchMode) {
     const rows: TreeRow[] = [];
     const seenKeys = new Set<string>();
+    const contextualizedFiles = new Set<number>();
+    const fileDepthById = new Map<number, number>();
 
     const pushRow = (row: TreeRow) => {
       if (seenKeys.has(row.key)) return;
@@ -102,22 +166,27 @@ export const buildTreeRows = (args: BuildTreeRowsArgs): TreeRow[] => {
       const file = fileById.get(result.fileId);
       if (!file) continue;
 
-      const ancestorPaths = folderAncestors(file.folderPath);
-      ancestorPaths.forEach((ancestorPath, index) => {
-        const folder = folderByPath.get(ancestorPath);
-        const label = index === 0 ? basename(snap.rootPath) : folder?.name ?? basename(ancestorPath);
-        const subLabel = index === 0 ? snap.rootPath : `${folder?.fileCount ?? 0} files`;
-        pushRow({
-          key: `search:folder:${ancestorPath || "__root__"}`,
-          kind: "folder",
-          depth: index,
-          label,
-          subLabel,
-          folderPath: ancestorPath,
+      let fileDepth = fileDepthById.get(file.id);
+      if (fileDepth === undefined) {
+        const ancestorPaths = folderAncestors(file.folderPath);
+        ancestorPaths.forEach((ancestorPath, index) => {
+          const folder = folderByPath.get(ancestorPath);
+          const label = index === 0 ? basename(snap.rootPath) : folder?.name ?? basename(ancestorPath);
+          const subLabel = index === 0 ? snap.rootPath : `${folder?.fileCount ?? 0} files`;
+          pushRow({
+            key: `search:folder:${ancestorPath || "__root__"}`,
+            kind: "folder",
+            depth: index,
+            label,
+            subLabel,
+            folderPath: ancestorPath,
+          });
         });
-      });
 
-      const fileDepth = ancestorPaths.length;
+        fileDepth = ancestorPaths.length;
+        fileDepthById.set(file.id, fileDepth);
+      }
+
       pushRow({
         key: `search:file:${file.id}`,
         kind: "file",
@@ -130,6 +199,11 @@ export const buildTreeRows = (args: BuildTreeRowsArgs): TreeRow[] => {
       });
 
       if (searchFileNamesOnly) {
+        if (contextualizedFiles.has(file.id)) {
+          continue;
+        }
+        contextualizedFiles.add(file.id);
+
         const preview = previewCache[file.id];
         if (!preview) {
           pushRow({
@@ -142,26 +216,8 @@ export const buildTreeRows = (args: BuildTreeRowsArgs): TreeRow[] => {
           continue;
         }
 
-        const orderedHeadings = [...preview.headings].sort((left, right) => left.order - right.order);
-        const depthByHeadingIndex = new Array<number>(orderedHeadings.length).fill(0);
-        const hasChildrenByHeadingIndex = new Array<boolean>(orderedHeadings.length).fill(false);
-        const indexStack: number[] = [];
-
-        for (let index = 0; index < orderedHeadings.length; index += 1) {
-          const currentHeading = orderedHeadings[index];
-          while (
-            indexStack.length > 0 &&
-            orderedHeadings[indexStack[indexStack.length - 1]].level >= currentHeading.level
-          ) {
-            indexStack.pop();
-          }
-
-          depthByHeadingIndex[index] = indexStack.length;
-          if (indexStack.length > 0) {
-            hasChildrenByHeadingIndex[indexStack[indexStack.length - 1]] = true;
-          }
-          indexStack.push(index);
-        }
+        const prepared = preparePreview(preview);
+        const { orderedHeadings, depthByHeadingIndex, hasChildrenByHeadingIndex } = prepared;
 
         orderedHeadings.forEach((heading, index) => {
           pushRow({
@@ -208,9 +264,12 @@ export const buildTreeRows = (args: BuildTreeRowsArgs): TreeRow[] => {
           continue;
         }
 
+        const prepared = preparePreview(preview);
         const targetHeading =
-          preview.headings.find((entry) => entry.order === (result.headingOrder ?? -1)) ??
-          preview.headings.find((entry) => entry.level === result.headingLevel && entry.text === result.headingText);
+          (result.headingOrder !== null ? prepared.headingByOrder.get(result.headingOrder) : undefined) ??
+          (result.headingLevel !== null && result.headingText
+            ? prepared.headingByLevelAndText.get(headingLookupKey(result.headingLevel, result.headingText))
+            : undefined);
 
         if (!targetHeading) {
           pushRow({
@@ -229,7 +288,7 @@ export const buildTreeRows = (args: BuildTreeRowsArgs): TreeRow[] => {
           continue;
         }
 
-        const chain = headingChainForTarget(preview.headings, targetHeading);
+        const chain = prepared.chainByHeadingOrder.get(targetHeading.order) ?? [targetHeading];
         chain.forEach((heading, index) => {
           pushRow({
             key: `search:heading:${file.id}:${heading.id}:${heading.order}:${heading.level}`,
@@ -312,26 +371,8 @@ export const buildTreeRows = (args: BuildTreeRowsArgs): TreeRow[] => {
         continue;
       }
 
-      const orderedHeadings = [...preview.headings].sort((left, right) => left.order - right.order);
-      const depthByHeadingIndex = new Array<number>(orderedHeadings.length).fill(0);
-      const hasChildrenByHeadingIndex = new Array<boolean>(orderedHeadings.length).fill(false);
-      const indexStack: number[] = [];
-
-      for (let index = 0; index < orderedHeadings.length; index += 1) {
-        const currentHeading = orderedHeadings[index];
-        while (
-          indexStack.length > 0 &&
-          orderedHeadings[indexStack[indexStack.length - 1]].level >= currentHeading.level
-        ) {
-          indexStack.pop();
-        }
-
-        depthByHeadingIndex[index] = indexStack.length;
-        if (indexStack.length > 0) {
-          hasChildrenByHeadingIndex[indexStack[indexStack.length - 1]] = true;
-        }
-        indexStack.push(index);
-      }
+      const prepared = preparePreview(preview);
+      const { orderedHeadings, depthByHeadingIndex, hasChildrenByHeadingIndex } = prepared;
 
       const visibilityStack: { level: number; collapsedChain: boolean }[] = [];
       for (let index = 0; index < orderedHeadings.length; index += 1) {

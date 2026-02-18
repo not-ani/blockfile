@@ -299,16 +299,27 @@ pub(crate) fn open_database(app: &AppHandle) -> CommandResult<Connection> {
             CREATE INDEX IF NOT EXISTS idx_files_root_relative ON files(root_id, relative_path);
             CREATE INDEX IF NOT EXISTS idx_files_root_modified ON files(root_id, modified_ms DESC, id DESC);
             CREATE INDEX IF NOT EXISTS idx_headings_file ON headings(file_id);
+            CREATE INDEX IF NOT EXISTS idx_headings_file_order ON headings(file_id, heading_order);
             CREATE INDEX IF NOT EXISTS idx_headings_normalized_length ON headings(length(normalized));
             CREATE INDEX IF NOT EXISTS idx_authors_file ON authors(file_id);
+            CREATE INDEX IF NOT EXISTS idx_authors_file_order ON authors(file_id, author_order);
             CREATE INDEX IF NOT EXISTS idx_authors_normalized_length ON authors(length(normalized));
             CREATE INDEX IF NOT EXISTS idx_chunks_file_order ON chunks(file_id, chunk_order);
             CREATE INDEX IF NOT EXISTS idx_chunks_root_file ON chunks(root_id, file_id);
+            CREATE INDEX IF NOT EXISTS idx_chunks_root_file_order ON chunks(root_id, file_id, chunk_order);
             CREATE INDEX IF NOT EXISTS idx_files_relative_length ON files(length(relative_path));
             CREATE INDEX IF NOT EXISTS idx_captures_root ON captures(root_id, id);
             ",
         )
         .map_err(|error| format!("Could not initialize index database: {error}"))?;
+
+    let _ = connection.query_row("PRAGMA cache_size = -65536", [], |row| row.get::<_, i64>(0));
+    let _ = connection.query_row("PRAGMA mmap_size = 268435456", [], |row| {
+        row.get::<_, i64>(0)
+    });
+    let _ = connection.query_row("PRAGMA wal_autocheckpoint = 1000", [], |row| {
+        row.get::<_, i64>(0)
+    });
 
     ensure_capture_schema(&connection)?;
 

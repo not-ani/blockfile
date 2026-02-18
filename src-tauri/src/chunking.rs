@@ -1,9 +1,58 @@
 use crate::types::{ParsedChunk, ParsedParagraph};
 use crate::util::is_probable_author_line;
 
-const CHUNK_MIN_CHARS: usize = 420;
-const CHUNK_MAX_CHARS: usize = 860;
-const CHUNK_OVERLAP_CHARS: usize = 160;
+const BASE_CHUNK_MIN_CHARS: usize = 700;
+const BASE_CHUNK_MAX_CHARS: usize = 1_600;
+const BASE_CHUNK_OVERLAP_CHARS: usize = 220;
+const LARGE_SECTION_THRESHOLD_CHARS: usize = 40_000;
+const HUGE_SECTION_THRESHOLD_CHARS: usize = 180_000;
+const MAX_CHUNKS_PER_SECTION: usize = 384;
+
+#[derive(Clone, Copy)]
+struct ChunkProfile {
+    min_chars: usize,
+    max_chars: usize,
+    overlap_chars: usize,
+}
+
+fn chunk_profile(total_chars: usize) -> ChunkProfile {
+    let mut profile = if total_chars >= HUGE_SECTION_THRESHOLD_CHARS {
+        ChunkProfile {
+            min_chars: 1_800,
+            max_chars: 3_600,
+            overlap_chars: 420,
+        }
+    } else if total_chars >= LARGE_SECTION_THRESHOLD_CHARS {
+        ChunkProfile {
+            min_chars: 1_200,
+            max_chars: 2_600,
+            overlap_chars: 320,
+        }
+    } else {
+        ChunkProfile {
+            min_chars: BASE_CHUNK_MIN_CHARS,
+            max_chars: BASE_CHUNK_MAX_CHARS,
+            overlap_chars: BASE_CHUNK_OVERLAP_CHARS,
+        }
+    };
+
+    let estimated_chunks = total_chars.div_ceil(profile.max_chars);
+    if estimated_chunks > MAX_CHUNKS_PER_SECTION {
+        let scale = estimated_chunks.div_ceil(MAX_CHUNKS_PER_SECTION).max(1);
+        profile.max_chars = profile.max_chars.saturating_mul(scale);
+        profile.min_chars = profile.min_chars.saturating_mul(scale);
+        profile.overlap_chars = profile
+            .overlap_chars
+            .saturating_mul(scale)
+            .min(profile.max_chars.saturating_sub(64));
+    }
+
+    if profile.min_chars >= profile.max_chars {
+        profile.min_chars = profile.max_chars.saturating_sub(64).max(64);
+    }
+
+    profile
+}
 
 fn split_text_into_chunks(text: &str) -> Vec<String> {
     let trimmed = text.trim();
@@ -12,16 +61,17 @@ fn split_text_into_chunks(text: &str) -> Vec<String> {
     }
 
     let chars = trimmed.chars().collect::<Vec<char>>();
-    if chars.len() <= CHUNK_MAX_CHARS {
+    let profile = chunk_profile(chars.len());
+    if chars.len() <= profile.max_chars {
         return vec![trimmed.to_string()];
     }
 
     let mut chunks = Vec::new();
     let mut start = 0_usize;
 
-    while start < chars.len() {
-        let max_end = (start + CHUNK_MAX_CHARS).min(chars.len());
-        let min_end = (start + CHUNK_MIN_CHARS).min(max_end);
+    while start < chars.len() && chunks.len() < MAX_CHUNKS_PER_SECTION {
+        let max_end = (start + profile.max_chars).min(chars.len());
+        let min_end = (start + profile.min_chars).min(max_end);
         let mut cut = max_end;
 
         for index in (min_end..max_end).rev() {
@@ -48,11 +98,29 @@ fn split_text_into_chunks(text: &str) -> Vec<String> {
             break;
         }
 
-        let next_start = cut.saturating_sub(CHUNK_OVERLAP_CHARS);
+        let advanced = cut.saturating_sub(start);
+        let overlap = profile.overlap_chars.min(advanced.saturating_sub(1));
+        let next_start = cut.saturating_sub(overlap);
         if next_start <= start {
             start = cut;
         } else {
             start = next_start;
+        }
+    }
+
+    if start < chars.len() {
+        let tail = chars[start..].iter().collect::<String>().trim().to_string();
+        if !tail.is_empty() {
+            if chunks.len() >= MAX_CHUNKS_PER_SECTION {
+                if let Some(last) = chunks.last_mut() {
+                    if !last.ends_with(&tail) {
+                        last.push('\n');
+                        last.push_str(&tail);
+                    }
+                }
+            } else {
+                chunks.push(tail);
+            }
         }
     }
 
