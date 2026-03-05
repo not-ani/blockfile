@@ -24,7 +24,8 @@ const NGRAM_TOKENIZER: &str = "bf_ngram";
 const MIN_FETCH_MULTIPLIER: usize = 5;
 const MIN_FETCH_FLOOR: usize = 80;
 const MAX_FETCH_LIMIT: usize = 1_800;
-const CHUNK_PREVIEW_CHARS: usize = 240;
+const CHUNK_PREVIEW_CHARS: usize = 480;
+const LEXICAL_WRITER_HEAP_BYTES: usize = 512_000_000;
 
 #[derive(Clone)]
 pub(crate) struct LexicalDocument {
@@ -385,7 +386,7 @@ pub(crate) fn replace_all_documents_from_connection(
 
     let mut writer = runtime
         .index
-        .writer(256_000_000)
+        .writer(LEXICAL_WRITER_HEAP_BYTES)
         .map_err(|error| format!("Could not create lexical index writer: {error}"))?;
 
     writer
@@ -622,6 +623,21 @@ pub(crate) fn replace_all_documents_from_connection(
     writer
         .commit()
         .map_err(|error| format!("Could not commit lexical index: {error}"))?;
+
+    let segment_ids = runtime
+        .index
+        .searchable_segment_ids()
+        .map_err(|error| format!("Could not read lexical segment IDs: {error}"))?;
+    if segment_ids.len() > 1 {
+        writer
+            .merge(&segment_ids)
+            .wait()
+            .map_err(|error| format!("Could not compact lexical segments: {error}"))?;
+    }
+    writer
+        .wait_merging_threads()
+        .map_err(|error| format!("Could not finalize lexical merge threads: {error}"))?;
+
     runtime
         .reader
         .reload()
@@ -644,51 +660,66 @@ pub(crate) fn search(
     }
 
     let runtime = lexical_runtime(app)?;
-    let runtime = runtime
-        .lock()
-        .map_err(|_| "Could not lock lexical runtime".to_string())?;
-    let searcher = runtime.reader.searcher();
+    let (index, searcher, runtime_fields) = {
+        let runtime = runtime
+            .lock()
+            .map_err(|_| "Could not lock lexical runtime".to_string())?;
+        (
+            runtime.index.clone(),
+            runtime.reader.searcher(),
+            runtime.fields.clone(),
+        )
+    };
 
     let target_limit = limit.clamp(10, 400);
-    let fetch_limit = target_limit
-        .saturating_mul(MIN_FETCH_MULTIPLIER)
-        .clamp(MIN_FETCH_FLOOR, MAX_FETCH_LIMIT);
-    let mut results = Vec::new();
-    let mut seen = HashSet::new();
+    let mut results = Vec::with_capacity(target_limit);
+    let mut seen = HashSet::with_capacity(target_limit.saturating_mul(2));
 
-    let lexical_fields = if file_name_only {
-        vec![runtime.fields.file_name]
+    let strict_fields = if file_name_only {
+        vec![runtime_fields.file_name]
     } else {
         vec![
-            runtime.fields.query_text,
-            runtime.fields.heading_text,
-            runtime.fields.author_text,
-            runtime.fields.file_name,
-            runtime.fields.relative_path,
-            runtime.fields.chunk_text,
+            runtime_fields.query_text,
+            runtime_fields.heading_text,
+            runtime_fields.author_text,
+            runtime_fields.file_name,
+            runtime_fields.relative_path,
+        ]
+    };
+    let recall_fields = if file_name_only {
+        vec![runtime_fields.file_name]
+    } else {
+        vec![
+            runtime_fields.query_text,
+            runtime_fields.heading_text,
+            runtime_fields.author_text,
+            runtime_fields.file_name,
+            runtime_fields.relative_path,
+            runtime_fields.chunk_text,
         ]
     };
     let prefix_fields = if file_name_only {
-        vec![runtime.fields.file_name]
+        vec![runtime_fields.file_name]
     } else {
         vec![
-            runtime.fields.prefix_text,
-            runtime.fields.heading_text,
-            runtime.fields.file_name,
-            runtime.fields.relative_path,
+            runtime_fields.prefix_text,
+            runtime_fields.heading_text,
+            runtime_fields.file_name,
+            runtime_fields.relative_path,
         ]
     };
     let ngram_fields = if file_name_only {
         Vec::new()
     } else {
-        vec![runtime.fields.ngram_text]
+        vec![runtime_fields.ngram_text]
     };
 
     let run_tier = |query_text: &str,
-                    fields: Vec<Field>,
+                    query_fields: Vec<Field>,
+                    fetch_limit: usize,
                     conjunction: bool|
      -> CommandResult<Vec<TantivyDocument>> {
-        let mut parser = QueryParser::for_index(&runtime.index, fields);
+        let mut parser = QueryParser::for_index(&index, query_fields);
         if conjunction {
             parser.set_conjunction_by_default();
         }
@@ -700,7 +731,7 @@ pub(crate) fn search(
             let Ok(root_id_u64) = u64::try_from(root_id) else {
                 return Ok(Vec::new());
             };
-            let root_term = Term::from_field_u64(runtime.fields.root_id, root_id_u64);
+            let root_term = Term::from_field_u64(runtime_fields.root_id, root_id_u64);
             let root_query: Box<dyn Query> =
                 Box::new(TermQuery::new(root_term, IndexRecordOption::Basic));
             Box::new(BooleanQuery::new(vec![
@@ -724,19 +755,20 @@ pub(crate) fn search(
         Ok(output)
     };
 
-    let mut tiers = vec![
-        (normalized.clone(), lexical_fields, true, 1_000.0_f64),
-        (
-            normalized
-                .split_whitespace()
-                .map(|token| format!("{token}*"))
-                .collect::<Vec<String>>()
-                .join(" "),
-            prefix_fields,
-            true,
-            2_000.0_f64,
-        ),
-    ];
+    let mut tiers = vec![(normalized.clone(), strict_fields, true, 1_000.0_f64)];
+    if !file_name_only {
+        tiers.push((normalized.clone(), recall_fields, false, 1_450.0_f64));
+    }
+    tiers.push((
+        normalized
+            .split_whitespace()
+            .map(|token| format!("{token}*"))
+            .collect::<Vec<String>>()
+            .join(" "),
+        prefix_fields,
+        true,
+        2_000.0_f64,
+    ));
     if !ngram_fields.is_empty() {
         tiers.push((
             ngrams_for_query(&normalized),
@@ -746,17 +778,21 @@ pub(crate) fn search(
         ));
     }
 
-    for (query_text, fields, conjunction, score_base) in tiers {
+    for (query_text, tier_fields, conjunction, score_base) in tiers {
         if query_text.trim().is_empty() {
             continue;
         }
-        let tier_documents = run_tier(&query_text, fields, conjunction)?;
+        let remaining = target_limit.saturating_sub(results.len()).max(10);
+        let fetch_limit = remaining
+            .saturating_mul(MIN_FETCH_MULTIPLIER)
+            .clamp(MIN_FETCH_FLOOR, MAX_FETCH_LIMIT);
+        let tier_documents = run_tier(&query_text, tier_fields, fetch_limit, conjunction)?;
         for (rank, document) in tier_documents.into_iter().enumerate() {
             if results.len() >= target_limit {
                 break;
             }
             let score = score_base + f64::from(rank as u32);
-            let Some(hit) = build_hit(&document, &runtime.fields, score, file_name_only) else {
+            let Some(hit) = build_hit(&document, &runtime_fields, score, file_name_only) else {
                 continue;
             };
             let key = dedupe_key(&hit);

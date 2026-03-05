@@ -11,8 +11,10 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema};
 use futures::TryStreamExt;
 use lancedb::database::CreateTableMode;
+use lancedb::index::vector::IvfHnswSqIndexBuilder;
 use lancedb::index::Index as LanceIndex;
 use lancedb::query::{ExecutableQuery, QueryBase, Select};
+use lancedb::DistanceType;
 use lancedb::{connect as connect_lancedb, Table as LanceTable};
 use ort::{session::Session as OrtSession, value::Tensor as OrtTensor};
 use rusqlite::params;
@@ -30,9 +32,96 @@ pub(crate) const SEMANTIC_MAX_DOCUMENTS: usize = 2_000_000;
 pub(crate) const SEMANTIC_EMBED_BATCH: usize = 24;
 pub(crate) const SEMANTIC_MAX_TOKENS: usize = 192;
 pub(crate) const SEMANTIC_MIN_QUERY_CHARS: usize = 3;
+const SEMANTIC_INDEX_MIN_ROWS: usize = 1_536;
+const SEMANTIC_INDEX_TARGET_PARTITION_SIZE: u32 = 72;
+const SEMANTIC_INDEX_SAMPLE_RATE: u32 = 512;
+const SEMANTIC_INDEX_MAX_ITERATIONS: u32 = 80;
+const SEMANTIC_INDEX_HNSW_EDGES: u32 = 32;
+const SEMANTIC_INDEX_HNSW_EF_CONSTRUCTION: u32 = 720;
+const SEMANTIC_QUERY_FETCH_MULTIPLIER: usize = 6;
+const SEMANTIC_QUERY_FETCH_FLOOR: usize = 96;
+const SEMANTIC_QUERY_FETCH_CEILING: usize = 1_600;
+const SEMANTIC_QUERY_NPROBES_FLOOR: usize = 28;
+const SEMANTIC_QUERY_NPROBES_CEILING: usize = 96;
+const SEMANTIC_QUERY_REFINE_FACTOR: u32 = 4;
+const SEMANTIC_QUERY_EF_MULTIPLIER: usize = 12;
+const SEMANTIC_QUERY_EF_FLOOR: usize = 120;
 
 static SEMANTIC_RUNTIME: OnceLock<Mutex<SemanticRuntime>> = OnceLock::new();
 static SEMANTIC_REBUILD_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+static SEMANTIC_TABLE_CACHE: OnceLock<Mutex<Option<SemanticTableCacheEntry>>> = OnceLock::new();
+
+#[derive(Clone)]
+struct SemanticTableCacheEntry {
+    uri: String,
+    table: LanceTable,
+}
+
+fn semantic_table_cache() -> &'static Mutex<Option<SemanticTableCacheEntry>> {
+    SEMANTIC_TABLE_CACHE.get_or_init(|| Mutex::new(None))
+}
+
+fn clear_semantic_table_cache() {
+    if let Ok(mut cache) = semantic_table_cache().lock() {
+        *cache = None;
+    }
+}
+
+fn semantic_index_partitions(item_count: usize) -> u32 {
+    let upper_bound = item_count.saturating_div(8).clamp(24, 4_096);
+    let estimated = ((item_count as f64).sqrt().ceil() as usize).saturating_mul(2);
+    u32::try_from(estimated.clamp(24, upper_bound)).unwrap_or(24)
+}
+
+fn semantic_fetch_limit(limit: usize) -> usize {
+    limit
+        .saturating_mul(SEMANTIC_QUERY_FETCH_MULTIPLIER)
+        .clamp(SEMANTIC_QUERY_FETCH_FLOOR, SEMANTIC_QUERY_FETCH_CEILING)
+}
+
+fn semantic_nprobes(limit: usize) -> usize {
+    let scaled = limit.saturating_div(2).max(SEMANTIC_QUERY_NPROBES_FLOOR);
+    scaled.clamp(SEMANTIC_QUERY_NPROBES_FLOOR, SEMANTIC_QUERY_NPROBES_CEILING)
+}
+
+fn semantic_ef(limit: usize) -> usize {
+    limit
+        .saturating_mul(SEMANTIC_QUERY_EF_MULTIPLIER)
+        .max(SEMANTIC_QUERY_EF_FLOOR)
+}
+
+async fn load_semantic_table(app: &AppHandle) -> CommandResult<Option<LanceTable>> {
+    let semantic_dir = semantic_db_dir(app)?;
+    if !semantic_dir.exists() {
+        return Ok(None);
+    }
+    let uri = path_display(&semantic_dir);
+
+    if let Ok(cache) = semantic_table_cache().lock() {
+        if let Some(entry) = cache.as_ref() {
+            if entry.uri == uri {
+                return Ok(Some(entry.table.clone()));
+            }
+        }
+    }
+
+    let db = connect_lancedb(&uri)
+        .execute()
+        .await
+        .map_err(|error| format!("Could not open semantic LanceDB: {error}"))?;
+    let table = match db.open_table(SEMANTIC_TABLE_NAME).execute().await {
+        Ok(table) => table,
+        Err(_) => return Ok(None),
+    };
+
+    if let Ok(mut cache) = semantic_table_cache().lock() {
+        *cache = Some(SemanticTableCacheEntry {
+            uri,
+            table: table.clone(),
+        });
+    }
+    Ok(Some(table))
+}
 
 pub(crate) fn semantic_db_dir(app: &AppHandle) -> CommandResult<PathBuf> {
     index_vector_dir(app)
@@ -627,6 +716,7 @@ async fn rebuild_semantic_index(app: AppHandle, force: bool) -> CommandResult<()
     let connection = open_database(&app)?;
     let root_fingerprint_ms = semantic_root_fingerprint_ms(&connection)?;
     if root_fingerprint_ms <= 0 {
+        clear_semantic_table_cache();
         return Ok(());
     }
 
@@ -634,6 +724,7 @@ async fn rebuild_semantic_index(app: AppHandle, force: bool) -> CommandResult<()
     if !force && previous_meta.root_fingerprint_ms >= root_fingerprint_ms {
         return Ok(());
     }
+    clear_semantic_table_cache();
 
     let candidates = load_semantic_candidates(&connection, SEMANTIC_MAX_DOCUMENTS)?;
     if candidates.is_empty() {
@@ -644,6 +735,7 @@ async fn rebuild_semantic_index(app: AppHandle, force: bool) -> CommandResult<()
             updated_at_ms: now_ms(),
         };
         write_semantic_meta(&app, &meta)?;
+        clear_semantic_table_cache();
         return Ok(());
     }
 
@@ -713,9 +805,19 @@ async fn rebuild_semantic_index(app: AppHandle, force: bool) -> CommandResult<()
         .await
         .map_err(|error| format!("Could not write semantic LanceDB table: {error}"))?;
 
-    if candidates.len() >= 4_096 {
+    if candidates.len() >= SEMANTIC_INDEX_MIN_ROWS {
+        let vector_index = LanceIndex::IvfHnswSq(
+            IvfHnswSqIndexBuilder::default()
+                .distance_type(DistanceType::Cosine)
+                .num_partitions(semantic_index_partitions(candidates.len()))
+                .target_partition_size(SEMANTIC_INDEX_TARGET_PARTITION_SIZE)
+                .sample_rate(SEMANTIC_INDEX_SAMPLE_RATE)
+                .max_iterations(SEMANTIC_INDEX_MAX_ITERATIONS)
+                .num_edges(SEMANTIC_INDEX_HNSW_EDGES)
+                .ef_construction(SEMANTIC_INDEX_HNSW_EF_CONSTRUCTION),
+        );
         table
-            .create_index(&["vector"], LanceIndex::Auto)
+            .create_index(&["vector"], vector_index)
             .execute()
             .await
             .map_err(|error| format!("Could not create semantic vector index: {error}"))?;
@@ -728,6 +830,7 @@ async fn rebuild_semantic_index(app: AppHandle, force: bool) -> CommandResult<()
         updated_at_ms: now_ms(),
     };
     write_semantic_meta(&app, &meta)?;
+    clear_semantic_table_cache();
     Ok(())
 }
 
@@ -842,18 +945,8 @@ pub(crate) async fn semantic_search(
     requested_root_id: Option<i64>,
     limit: usize,
 ) -> CommandResult<Vec<SearchHit>> {
-    let semantic_dir = semantic_db_dir(app)?;
-    if !semantic_dir.exists() {
+    let Some(table) = load_semantic_table(app).await? else {
         return Ok(Vec::new());
-    }
-    let uri = path_display(&semantic_dir);
-    let db = connect_lancedb(&uri)
-        .execute()
-        .await
-        .map_err(|error| format!("Could not open semantic LanceDB: {error}"))?;
-    let table: LanceTable = match db.open_table(SEMANTIC_TABLE_NAME).execute().await {
-        Ok(table) => table,
-        Err(_) => return Ok(Vec::new()),
     };
 
     let app_for_embedding = app.clone();
@@ -871,7 +964,8 @@ pub(crate) async fn semantic_search(
         .query()
         .nearest_to(query_embedding[0].as_slice())
         .map_err(|error| format!("Could not build semantic vector query: {error}"))?
-        .limit(limit.saturating_mul(2))
+        .distance_type(DistanceType::Cosine)
+        .limit(semantic_fetch_limit(limit))
         .select(Select::columns(&[
             "file_id",
             "kind",
@@ -882,8 +976,9 @@ pub(crate) async fn semantic_search(
             "heading_text",
             "heading_order",
         ]))
-        .nprobes(18)
-        .refine_factor(2);
+        .nprobes(semantic_nprobes(limit))
+        .refine_factor(SEMANTIC_QUERY_REFINE_FACTOR)
+        .ef(semantic_ef(limit));
 
     if let Some(root_id) = requested_root_id {
         vector_query = vector_query.only_if(format!("root_id = {root_id}"));

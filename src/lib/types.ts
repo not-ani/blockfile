@@ -6,6 +6,11 @@ export type RootSummary = {
   lastIndexedMs: number;
 };
 
+export type AddRootResult = {
+  canonicalPath: string;
+  shouldIndex: boolean;
+};
+
 export type FolderEntry = {
   path: string;
   name: string;

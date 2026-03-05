@@ -11,6 +11,7 @@ type TopControlsProps = {
   setSearchInputRef: (element: HTMLInputElement) => void;
   isIndexing: Accessor<boolean>;
   addFolder: () => void;
+  openIndexesPage: () => void;
   selectedRootPath: Accessor<string>;
   runIndexForSelection: () => Promise<void>;
   activeRootLabel: Accessor<string>;
@@ -70,6 +71,17 @@ export default function TopControls(props: TopControlsProps) {
           </svg>
         </div>
         <h1 class="text-sm font-semibold text-white">BlockFile</h1>
+        <button
+          class="inline-flex h-7 items-center gap-1.5 rounded-md border border-neutral-700 bg-neutral-900 px-2.5 text-xs font-medium text-neutral-200 transition hover:border-neutral-600 hover:text-white"
+          onClick={props.openIndexesPage}
+          title="Open Indexes page"
+          type="button"
+        >
+          <svg class="h-3.5 w-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16" />
+          </svg>
+          Indexes
+        </button>
         
         <div class="h-4 w-px bg-neutral-700 mx-1" />
         
@@ -216,7 +228,7 @@ export default function TopControls(props: TopControlsProps) {
             <svg class="h-3.5 w-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4" />
             </svg>
-            Add
+            Add folders
           </button>
           <button
             class="inline-flex h-8 items-center gap-1.5 rounded-md border border-blue-600 bg-blue-600 px-3 text-xs font-medium text-white transition hover:border-blue-500 hover:bg-blue-500 disabled:opacity-50"

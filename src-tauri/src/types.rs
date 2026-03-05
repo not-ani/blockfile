@@ -17,6 +17,13 @@ pub(crate) struct RootSummary {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+pub(crate) struct AddRootResult {
+    pub canonical_path: String,
+    pub should_index: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct IndexStats {
     pub scanned: usize,
     pub updated: usize,

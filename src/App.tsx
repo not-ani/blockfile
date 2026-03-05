@@ -3,6 +3,7 @@ import { openPath } from "@tauri-apps/plugin-opener";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { batch, createEffect, createMemo, createSignal, onCleanup, onMount, startTransition, untrack } from "solid-js";
 import CaptureTargetPanel from "./components/CaptureTargetPanel.tsx";
+import IndexesPage from "./components/IndexesPage.tsx";
 import SidePreviewPane from "./components/SidePreviewPane.tsx";
 import TopControls from "./components/TopControls.tsx";
 import TreeView from "./components/TreeView.tsx";
@@ -11,6 +12,7 @@ import { isAbortError, searchDebatifyTags } from "./lib/remoteSearch/client";
 import { DEBATIFY_REMOTE_FOLDER_PATH } from "./lib/remoteSearch/treeRows";
 import type { DebatifyTagHit } from "./lib/remoteSearch/types";
 import type {
+  AddRootResult,
   CaptureInsertResult,
   CaptureTarget,
   CaptureTargetPreview,
@@ -37,6 +39,7 @@ import {
 import { buildSnapshotIndex, buildTreeRows } from "./lib/treeRows";
 
 function App() {
+  type AppPage = "workspace" | "indexes";
   const LEFT_RAIL_DEFAULT_PX = 560;
   const LEFT_RAIL_MIN_PX = 420;
   const TREE_PANEL_MIN_PX = 360;
@@ -45,6 +48,11 @@ function App() {
   const SEARCH_FILENAME_ONLY_PREFS_KEY = "blockfile.searchFileNamesOnly.v1";
   const SEARCH_DEBATIFY_ENABLED_PREFS_KEY = "blockfile.searchDebatifyEnabled.v1";
   const defaultExpandedFolders = () => new Set(["", DEBATIFY_REMOTE_FOLDER_PATH]);
+  const pageFromHash = (): AppPage => {
+    const hashValue = window.location.hash.replace(/^#\/?/, "").toLowerCase();
+    return hashValue.startsWith("indexes") ? "indexes" : "workspace";
+  };
+  const pageHash = (page: AppPage) => (page === "indexes" ? "#/indexes" : "#/");
 
   const loadStoredBoolean = (key: string, fallback: boolean) => {
     try {
@@ -75,6 +83,7 @@ function App() {
   const [collapsedHeadings, setCollapsedHeadings] = createSignal<Set<string>>(new Set());
 
   const [searchQuery, setSearchQuery] = createSignal("");
+  const [activePage, setActivePage] = createSignal<AppPage>(pageFromHash());
   const [searchResults, setSearchResults] = createSignal<SearchHit[]>([]);
   const [remoteTagResults, setRemoteTagResults] = createSignal<DebatifyTagHit[]>([]);
   const [searchFileNamesOnly, setSearchFileNamesOnly] = createSignal(
@@ -254,6 +263,21 @@ function App() {
       ? roots().reduce((latest, root) => Math.max(latest, root.lastIndexedMs), 0)
       : selectedRoot()?.lastIndexedMs ?? 0,
   );
+  const navigateToPage = (page: AppPage, replace = false) => {
+    setActivePage(page);
+    const nextHash = pageHash(page);
+    if (window.location.hash === nextHash) return;
+
+    if (replace) {
+      const nextUrl = `${window.location.pathname}${window.location.search}${nextHash}`;
+      window.history.replaceState(null, "", nextUrl);
+      return;
+    }
+
+    window.location.hash = nextHash;
+  };
+  const openIndexesPage = () => navigateToPage("indexes");
+  const openWorkspacePage = () => navigateToPage("workspace");
 
   const withFolderSet = (mutator: (set: Set<string>) => void) => {
     setExpandedFolders((current) => {
@@ -1060,78 +1084,182 @@ function App() {
     }
   };
 
+  const runIndexForAllRoots = async () => {
+    const targetRoots = roots().map((root) => root.path);
+    if (targetRoots.length === 0) return;
+
+    setIndexProgress(null);
+    setIsIndexing(true);
+    try {
+      let scanned = 0;
+      let updated = 0;
+      let skipped = 0;
+      let removed = 0;
+      for (const path of targetRoots) {
+        const stats = await invokeTyped<IndexStats>("index_root", { path });
+        scanned += stats.scanned;
+        updated += stats.updated;
+        skipped += stats.skipped;
+        removed += stats.removed;
+      }
+      setStatus(
+        `Reindexed ${targetRoots.length} folders. Scanned ${scanned} docx, updated ${updated}, skipped ${skipped}, removed ${removed}.`,
+      );
+      await loadRoots();
+      await loadAllSnapshots();
+    } catch (error) {
+      setStatus(`Bulk reindex failed: ${String(error)}`);
+    } finally {
+      setIndexProgress(null);
+      setIsIndexing(false);
+    }
+  };
+
   const runIndexForSelection = async () => {
     if (isAllRootsSelected()) {
-      const targetRoots = roots().map((root) => root.path);
-      if (targetRoots.length === 0) return;
-
-      setIndexProgress(null);
-      setIsIndexing(true);
-      try {
-        let scanned = 0;
-        let updated = 0;
-        let skipped = 0;
-        let removed = 0;
-        for (const path of targetRoots) {
-          const stats = await invokeTyped<IndexStats>("index_root", { path });
-          scanned += stats.scanned;
-          updated += stats.updated;
-          skipped += stats.skipped;
-          removed += stats.removed;
-        }
-        setStatus(
-          `Reindexed ${targetRoots.length} folders. Scanned ${scanned} docx, updated ${updated}, skipped ${skipped}, removed ${removed}.`,
-        );
-        await loadRoots();
-        await loadAllSnapshots();
-      } catch (error) {
-        setStatus(`Bulk reindex failed: ${String(error)}`);
-      } finally {
-        setIndexProgress(null);
-        setIsIndexing(false);
-      }
+      await runIndexForAllRoots();
       return;
     }
 
     await runIndex(selectedRootPath());
   };
 
-  const addFolder = async () => {
+  const parseSelectedFolders = (selected: unknown): string[] => {
+    const rawPaths =
+      typeof selected === "string"
+        ? [selected]
+        : Array.isArray(selected)
+          ? selected.filter((entry: unknown): entry is string => typeof entry === "string")
+          : [];
+
+    const normalized = rawPaths.map((path) => path.trim()).filter((path) => path.length > 0);
+    return Array.from(new Set(normalized));
+  };
+
+  const addFolders = async () => {
     setStatus("Opening folder picker...");
 
-    let selectedPath: string | null = null;
+    let selectedPaths: string[] = [];
     try {
       const selected: unknown = await open({
         directory: true,
-        multiple: false,
-        title: "Choose a folder to index",
+        multiple: true,
+        title: "Choose one or more folders to index",
       });
-      if (typeof selected === "string") {
-        selectedPath = selected;
-      } else if (Array.isArray(selected)) {
-        selectedPath = selected.find((entry: unknown): entry is string => typeof entry === "string") ?? null;
-      }
+      selectedPaths = parseSelectedFolders(selected);
     } catch (error) {
       setStatus(`Folder picker failed: ${String(error)}`);
     }
 
-    if (!selectedPath) {
-      const manual = window.prompt("Paste absolute folder path:", "")?.trim();
+    if (selectedPaths.length === 0) {
+      const manual = window
+        .prompt("Paste absolute folder path(s). Use commas or new lines for multiple folders:", "")
+        ?.trim();
       if (!manual) {
         setStatus("Folder selection cancelled.");
         return;
       }
-      selectedPath = manual;
+      selectedPaths = Array.from(
+        new Set(
+          manual
+            .split(/[\n,]+/)
+            .map((path) => path.trim())
+            .filter((path) => path.length > 0),
+        ),
+      );
     }
 
-    try {
-      const canonicalPath = await invokeTyped<string>("add_root", { path: selectedPath });
-      setSelectedRootPath(canonicalPath);
-      await loadRoots();
-      await runIndex(canonicalPath);
-    } catch (error) {
-      setStatus(`Could not add folder index: ${String(error)}`);
+    if (selectedPaths.length === 0) {
+      setStatus("No valid folder paths provided.");
+      return;
     }
+
+    const toIndex: string[] = [];
+    const canonicalPaths: string[] = [];
+    let addFailures = 0;
+    let alreadyIndexed = 0;
+
+    for (const path of selectedPaths) {
+      try {
+        const addResult = await invokeTyped<AddRootResult>("add_root", { path });
+        canonicalPaths.push(addResult.canonicalPath);
+        if (addResult.shouldIndex) {
+          toIndex.push(addResult.canonicalPath);
+        } else {
+          alreadyIndexed += 1;
+        }
+      } catch (error) {
+        addFailures += 1;
+        console.error(`Could not add folder '${path}':`, error);
+      }
+    }
+
+    if (canonicalPaths.length === 0) {
+      setStatus("Could not add any folder index.");
+      return;
+    }
+
+    const focusPath = canonicalPaths[canonicalPaths.length - 1];
+    setSelectedRootPath(focusPath);
+    await loadRoots();
+
+    let indexedCount = 0;
+    let scanned = 0;
+    let updated = 0;
+    let skipped = 0;
+    let removed = 0;
+    let indexFailures = 0;
+
+    if (toIndex.length > 0) {
+      setIndexProgress(null);
+      setIsIndexing(true);
+      try {
+        for (let index = 0; index < toIndex.length; index += 1) {
+          const path = toIndex[index];
+          setStatus(`Indexing ${path} (${index + 1}/${toIndex.length})...`);
+          try {
+            const stats = await invokeTyped<IndexStats>("index_root", { path });
+            scanned += stats.scanned;
+            updated += stats.updated;
+            skipped += stats.skipped;
+            removed += stats.removed;
+            indexedCount += 1;
+          } catch (error) {
+            indexFailures += 1;
+            console.error(`Could not index folder '${path}':`, error);
+          }
+        }
+      } finally {
+        setIndexProgress(null);
+        setIsIndexing(false);
+      }
+    }
+
+    await loadRoots();
+    await loadSnapshot(focusPath);
+
+    const summary = [
+      `Added ${canonicalPaths.length - addFailures}/${selectedPaths.length} folders`,
+      toIndex.length > 0
+        ? `indexed ${indexedCount}/${toIndex.length} (scanned ${scanned}, updated ${updated}, skipped ${skipped}, removed ${removed})`
+        : "no indexing needed",
+      alreadyIndexed > 0 ? `${alreadyIndexed} already indexed` : "",
+      addFailures > 0 ? `${addFailures} add failures` : "",
+      indexFailures > 0 ? `${indexFailures} index failures` : "",
+    ]
+      .filter(Boolean)
+      .join("; ");
+
+    setStatus(summary);
+  };
+
+  const openWorkspaceRoot = (rootPath: string) => {
+    if (!rootPath) return;
+    setSelectedRootPath(rootPath);
+    if (activePage() !== "workspace") {
+      navigateToPage("workspace");
+    }
+    void loadSnapshot(rootPath);
   };
 
   const snapshotIndex = createMemo(() => buildSnapshotIndex(activeSnapshot()));
@@ -1717,6 +1845,10 @@ function App() {
       syncTreeViewportState();
     };
     const onGlobalKeyDown = (event: KeyboardEvent) => {
+      if (activePage() !== "workspace") {
+        return;
+      }
+
       const key = event.key;
 
       if ((event.metaKey || event.ctrlKey) && key.toLowerCase() === "k") {
@@ -1771,6 +1903,9 @@ function App() {
         scheduleFocusRelativeRow(key === "ArrowDown" ? 1 : -1);
       }
     };
+    const onHashChange = () => {
+      setActivePage(pageFromHash());
+    };
 
     let listenerDisposed = false;
     void listen<IndexProgress>("index-progress", (event) => {
@@ -1790,6 +1925,8 @@ function App() {
 
     window.addEventListener("resize", onResize);
     window.addEventListener("keydown", onGlobalKeyDown, true);
+    window.addEventListener("hashchange", onHashChange);
+    navigateToPage(pageFromHash(), true);
 
     onCleanup(() => {
       listenerDisposed = true;
@@ -1799,6 +1936,7 @@ function App() {
       stopPreviewPanelResize?.();
       window.removeEventListener("resize", onResize);
       window.removeEventListener("keydown", onGlobalKeyDown, true);
+      window.removeEventListener("hashchange", onHashChange);
       if (headingPreviewTimer) {
         window.clearTimeout(headingPreviewTimer);
         headingPreviewTimer = 0;
@@ -1836,110 +1974,128 @@ function App() {
   return (
     <div class="h-screen bg-[#0a0a0a] overflow-hidden">
       <div class="flex h-full w-full flex-col">
-        <TopControls
-          activeLastIndexedMs={activeLastIndexedMs}
-          activeRootLabel={activeRootLabel}
-          addFolder={addFolder}
-          copyToast={copyToast}
-          isIndexing={isIndexing}
-          isSearching={isSearching}
-          roots={roots}
-          runIndexForSelection={runIndexForSelection}
-          searchQuery={searchQuery}
-          searchFileNamesOnly={searchFileNamesOnly}
-          searchDebatifyEnabled={searchDebatifyEnabled}
-          searchSemanticEnabled={searchSemanticEnabled}
-          selectedRootPath={selectedRootPath}
-          indexProgress={indexProgress}
-          setSearchInputRef={setSearchInputElement}
-          setSearchQuery={setSearchQuery}
-          setSelectedRootPath={setSelectedRootPath}
-          toggleFileNameSearchMode={toggleFileNameSearchMode}
-          toggleDebatifySearchMode={toggleDebatifySearchMode}
-          toggleSemanticSearchMode={toggleSemanticSearchMode}
-          status={status}
-          showCapturePanel={showCapturePanel}
-          showPreviewPanel={showPreviewPanel}
-          toggleCapturePanel={toggleCapturePanel}
-          togglePreviewPanel={togglePreviewPanel}
-        />
+        {activePage() === "workspace" ? (
+          <>
+            <TopControls
+              activeLastIndexedMs={activeLastIndexedMs}
+              activeRootLabel={activeRootLabel}
+              addFolder={addFolders}
+              copyToast={copyToast}
+              isIndexing={isIndexing}
+              isSearching={isSearching}
+              roots={roots}
+              runIndexForSelection={runIndexForSelection}
+              searchQuery={searchQuery}
+              searchFileNamesOnly={searchFileNamesOnly}
+              searchDebatifyEnabled={searchDebatifyEnabled}
+              searchSemanticEnabled={searchSemanticEnabled}
+              selectedRootPath={selectedRootPath}
+              indexProgress={indexProgress}
+              openIndexesPage={openIndexesPage}
+              setSearchInputRef={setSearchInputElement}
+              setSearchQuery={setSearchQuery}
+              setSelectedRootPath={setSelectedRootPath}
+              toggleFileNameSearchMode={toggleFileNameSearchMode}
+              toggleDebatifySearchMode={toggleDebatifySearchMode}
+              toggleSemanticSearchMode={toggleSemanticSearchMode}
+              status={status}
+              showCapturePanel={showCapturePanel}
+              showPreviewPanel={showPreviewPanel}
+              toggleCapturePanel={toggleCapturePanel}
+              togglePreviewPanel={togglePreviewPanel}
+            />
 
-        <div class="flex min-h-0 flex-1">
-          <div class="workspace-split h-full min-h-0 min-w-0 flex-1" style={{ "--left-rail-width": showCapturePanel() ? `${leftRailWidthPx()}px` : '0px' }}>
-            {showCapturePanel() && (
-              <aside class="h-full min-h-0 border-r border-neutral-800/50 bg-neutral-950/30 flex flex-col">
-                <CaptureTargetPanel
-                  addCaptureHeading={addCaptureHeading}
-                  captureRootPath={captureRootPath}
-                  captureTargetH1ToH4={captureTargetH1ToH4}
-                  captureTargetPreview={captureTargetPreview}
-                  captureTargets={captureTargets}
-                  createCaptureTarget={createCaptureTarget}
-                  deleteCaptureHeading={deleteCaptureHeading}
-                  isAllRootsSelected={isAllRootsSelected}
-                  isLoadingCapturePreview={isLoadingCapturePreview}
-                  isLoadingCaptureTargets={isLoadingCaptureTargets}
-                  moveCaptureHeading={moveCaptureHeading}
-                  selectCaptureTargetFromFilesystem={selectCaptureTargetFromFilesystem}
-                  selectedCaptureHeadingOrder={selectedCaptureHeadingOrder}
-                  selectedCaptureTarget={selectedCaptureTarget}
-                  selectedCaptureTargetMeta={selectedCaptureTargetMeta}
-                  setSelectedCaptureHeadingOrder={setSelectedCaptureHeadingOrder}
-                  setSelectedCaptureTarget={setCaptureTargetSelection}
-                />
-              </aside>
-            )}
+            <div class="flex min-h-0 flex-1">
+              <div
+                class="workspace-split h-full min-h-0 min-w-0 flex-1"
+                style={{ "--left-rail-width": showCapturePanel() ? `${leftRailWidthPx()}px` : "0px" }}
+              >
+                {showCapturePanel() && (
+                  <aside class="h-full min-h-0 border-r border-neutral-800/50 bg-neutral-950/30 flex flex-col">
+                    <CaptureTargetPanel
+                      addCaptureHeading={addCaptureHeading}
+                      captureRootPath={captureRootPath}
+                      captureTargetH1ToH4={captureTargetH1ToH4}
+                      captureTargetPreview={captureTargetPreview}
+                      captureTargets={captureTargets}
+                      createCaptureTarget={createCaptureTarget}
+                      deleteCaptureHeading={deleteCaptureHeading}
+                      isAllRootsSelected={isAllRootsSelected}
+                      isLoadingCapturePreview={isLoadingCapturePreview}
+                      isLoadingCaptureTargets={isLoadingCaptureTargets}
+                      moveCaptureHeading={moveCaptureHeading}
+                      selectCaptureTargetFromFilesystem={selectCaptureTargetFromFilesystem}
+                      selectedCaptureHeadingOrder={selectedCaptureHeadingOrder}
+                      selectedCaptureTarget={selectedCaptureTarget}
+                      selectedCaptureTargetMeta={selectedCaptureTargetMeta}
+                      setSelectedCaptureHeadingOrder={setSelectedCaptureHeadingOrder}
+                      setSelectedCaptureTarget={setCaptureTargetSelection}
+                    />
+                  </aside>
+                )}
 
-            {showCapturePanel() && (
-              <button
-                aria-label="Resize insert preview panel"
-                class="panel-resize-handle hidden lg:flex"
-                onMouseDown={startLeftRailResize}
-                title="Drag to resize"
-                type="button"
-              />
-            )}
+                {showCapturePanel() && (
+                  <button
+                    aria-label="Resize insert preview panel"
+                    class="panel-resize-handle hidden lg:flex"
+                    onMouseDown={startLeftRailResize}
+                    title="Drag to resize"
+                    type="button"
+                  />
+                )}
 
-            <div class="h-full min-h-0 min-w-0 flex-1 bg-neutral-950/20">
-              <TreeView
-                activateRow={activateRow}
-                applyPreviewFromRow={applyPreviewFromRow}
-                collapsedHeadings={collapsedHeadings}
-                expandedFiles={expandedFiles}
-                expandedFolders={expandedFolders}
-                focusedNodeKey={focusedNodeKey}
-                isLoadingSnapshot={isLoadingSnapshot}
-                isSearching={isSearching}
-                onTreeKeyDown={onTreeKeyDown}
-                onTreeScroll={scheduleTreeScrollTop}
-                openSearchResult={openSearchResult}
-                searchMode={searchMode}
-                selectedRootPath={selectedRootPath}
-                setFocusedNodeKey={setFocusedNodeKey}
-                setTreeRef={setTreeElement}
-                treeRowsLength={() => treeRows().length}
-                virtualWindow={virtualWindow}
-                visibleTreeRows={visibleTreeRows}
-              />
+                <div class="h-full min-h-0 min-w-0 flex-1 bg-neutral-950/20">
+                  <TreeView
+                    activateRow={activateRow}
+                    applyPreviewFromRow={applyPreviewFromRow}
+                    collapsedHeadings={collapsedHeadings}
+                    expandedFiles={expandedFiles}
+                    expandedFolders={expandedFolders}
+                    focusedNodeKey={focusedNodeKey}
+                    isLoadingSnapshot={isLoadingSnapshot}
+                    isSearching={isSearching}
+                    onTreeKeyDown={onTreeKeyDown}
+                    onTreeScroll={scheduleTreeScrollTop}
+                    openSearchResult={openSearchResult}
+                    searchMode={searchMode}
+                    selectedRootPath={selectedRootPath}
+                    setFocusedNodeKey={setFocusedNodeKey}
+                    setTreeRef={setTreeElement}
+                    treeRowsLength={() => treeRows().length}
+                    virtualWindow={virtualWindow}
+                    visibleTreeRows={visibleTreeRows}
+                  />
+                </div>
+              </div>
+
+              {showPreviewPanel() && (
+                <>
+                  <button
+                    aria-label="Resize preview panel"
+                    class="panel-resize-handle flex"
+                    onMouseDown={startPreviewPanelResize}
+                    title="Drag to resize preview"
+                    type="button"
+                  />
+                  <SidePreviewPane sidePreview={sidePreview} width={previewPanelWidthPx} />
+                </>
+              )}
             </div>
-          </div>
-
-          {showPreviewPanel() && (
-            <>
-              <button
-                aria-label="Resize preview panel"
-                class="panel-resize-handle flex"
-                onMouseDown={startPreviewPanelResize}
-                title="Drag to resize preview"
-                type="button"
-              />
-              <SidePreviewPane
-                sidePreview={sidePreview}
-                width={previewPanelWidthPx}
-              />
-            </>
-          )}
-        </div>
+          </>
+        ) : (
+          <IndexesPage
+            addFolders={addFolders}
+            indexProgress={indexProgress}
+            isIndexing={isIndexing}
+            openWorkspacePage={openWorkspacePage}
+            openWorkspaceRoot={openWorkspaceRoot}
+            reindexAll={runIndexForAllRoots}
+            reindexRoot={runIndex}
+            roots={roots}
+            selectedRootPath={selectedRootPath}
+            status={status}
+          />
+        )}
       </div>
     </div>
   );

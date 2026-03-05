@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 use futures::future;
@@ -13,10 +13,16 @@ use crate::vector::{self, VECTOR_MIN_QUERY_CHARS};
 use crate::CommandResult;
 
 const DEFAULT_RESULT_LIMIT: usize = 120;
-const CACHE_CAPACITY: usize = 480;
-const CACHE_TTL_MS: i64 = 120_000;
+const CACHE_CAPACITY: usize = 1_024;
+const CACHE_TTL_MS: i64 = 300_000;
+const ROOT_ID_CACHE_CAPACITY: usize = 192;
+const ROOT_ID_CACHE_TTL_MS: i64 = 60_000;
 const LEXICAL_SOFT_BUDGET_MS: u64 = 60;
 const HYBRID_SOFT_BUDGET_MS: u64 = 180;
+const RRF_K: f64 = 55.0;
+const RRF_LEXICAL_WEIGHT: f64 = 1.25;
+const RRF_SEMANTIC_WEIGHT: f64 = 1.0;
+const RRF_BOTH_MODALITIES_BONUS: f64 = 0.08;
 
 #[derive(Clone)]
 struct CacheEntry {
@@ -65,10 +71,67 @@ fn query_cache() -> &'static std::sync::Mutex<QueryCache> {
     QUERY_CACHE.get_or_init(|| std::sync::Mutex::new(QueryCache::default()))
 }
 
+#[derive(Default)]
+struct RootIdCache {
+    order: VecDeque<String>,
+    entries: HashMap<String, RootIdCacheEntry>,
+}
+
+#[derive(Clone, Copy)]
+struct RootIdCacheEntry {
+    created_at_ms: i64,
+    value: Option<i64>,
+}
+
+impl RootIdCache {
+    fn get(&self, path: &str) -> Option<Option<i64>> {
+        let entry = self.entries.get(path)?;
+        if now_ms() - entry.created_at_ms > ROOT_ID_CACHE_TTL_MS {
+            return None;
+        }
+        Some(entry.value)
+    }
+
+    fn put(&mut self, path: String, value: Option<i64>) {
+        if self.entries.contains_key(&path) {
+            self.order.retain(|item| item != &path);
+        }
+        self.order.push_back(path.clone());
+        self.entries.insert(
+            path,
+            RootIdCacheEntry {
+                created_at_ms: now_ms(),
+                value,
+            },
+        );
+
+        while self.order.len() > ROOT_ID_CACHE_CAPACITY {
+            if let Some(oldest) = self.order.pop_front() {
+                self.entries.remove(&oldest);
+            }
+        }
+    }
+
+    fn clear(&mut self) {
+        self.order.clear();
+        self.entries.clear();
+    }
+}
+
+static ROOT_ID_CACHE: std::sync::OnceLock<std::sync::Mutex<RootIdCache>> =
+    std::sync::OnceLock::new();
+
+fn root_id_cache() -> &'static std::sync::Mutex<RootIdCache> {
+    ROOT_ID_CACHE.get_or_init(|| std::sync::Mutex::new(RootIdCache::default()))
+}
+
 pub(crate) fn clear_query_cache() {
     if let Ok(mut cache) = query_cache().lock() {
         cache.entries.clear();
         cache.order.clear();
+    }
+    if let Ok(mut cache) = root_id_cache().lock() {
+        cache.clear();
     }
 }
 
@@ -95,8 +158,18 @@ fn resolve_requested_root_id(
     let canonical = canonicalize_folder(&root_path)
         .map(|path| path_display(&path))
         .unwrap_or(root_path);
+    if let Ok(cache) = root_id_cache().lock() {
+        if let Some(cached) = cache.get(&canonical) {
+            return Ok(cached);
+        }
+    }
+
     let connection = open_database(app)?;
-    root_id(&connection, &canonical)
+    let resolved = root_id(&connection, &canonical)?;
+    if let Ok(mut cache) = root_id_cache().lock() {
+        cache.put(canonical, resolved);
+    }
+    Ok(resolved)
 }
 
 fn cache_key(mode: &str, query: &str, root_id: Option<i64>, limit: usize) -> String {
@@ -140,25 +213,27 @@ fn fuse_rrf(
 ) -> Vec<SearchHit> {
     let mut scores = HashMap::<String, f64>::new();
     let mut by_key = HashMap::<String, SearchHit>::new();
-    let mut seen_lexical = HashMap::<String, bool>::new();
-    let mut seen_semantic = HashMap::<String, bool>::new();
+    let mut seen_lexical = HashSet::<String>::new();
+    let mut seen_semantic = HashSet::<String>::new();
 
     for (rank, hit) in lexical_hits.iter().enumerate() {
         let key = dedupe_key(hit);
+        let rank_score = RRF_LEXICAL_WEIGHT / (RRF_K + f64::from((rank + 1) as u32));
         scores
             .entry(key.clone())
-            .and_modify(|value| *value += 1.0 / (60.0 + f64::from((rank + 1) as u32)))
-            .or_insert(1.0 / (60.0 + f64::from((rank + 1) as u32)));
+            .and_modify(|value| *value += rank_score)
+            .or_insert(rank_score);
         by_key.entry(key.clone()).or_insert_with(|| hit.clone());
-        seen_lexical.insert(key, true);
+        seen_lexical.insert(key);
     }
 
     for (rank, hit) in semantic_hits.iter().enumerate() {
         let key = dedupe_key(hit);
+        let rank_score = RRF_SEMANTIC_WEIGHT / (RRF_K + f64::from((rank + 1) as u32));
         scores
             .entry(key.clone())
-            .and_modify(|value| *value += 1.0 / (60.0 + f64::from((rank + 1) as u32)))
-            .or_insert(1.0 / (60.0 + f64::from((rank + 1) as u32)));
+            .and_modify(|value| *value += rank_score)
+            .or_insert(rank_score);
 
         by_key
             .entry(key.clone())
@@ -168,17 +243,16 @@ fn fuse_rrf(
                 }
             })
             .or_insert_with(|| hit.clone());
-        seen_semantic.insert(key, true);
+        seen_semantic.insert(key);
     }
 
     let mut ranked = scores
         .into_iter()
-        .filter_map(|(key, score)| {
+        .filter_map(|(key, mut score)| {
             let mut hit = by_key.get(&key)?.clone();
-            if seen_lexical.get(&key).copied().unwrap_or(false)
-                && seen_semantic.get(&key).copied().unwrap_or(false)
-            {
+            if seen_lexical.contains(&key) && seen_semantic.contains(&key) {
                 hit.source = "hybrid".to_string();
+                score += RRF_BOTH_MODALITIES_BONUS;
             }
             hit.score = 1_000.0 - (score * 1_000.0);
             Some(hit)

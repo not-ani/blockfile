@@ -30,14 +30,39 @@ use crate::docx_capture::{fallback_body_insertion_index, insertion_index_after_p
 use roxmltree::{Document, Node};
 
 #[tauri::command]
-pub(crate) fn add_root(app: AppHandle, path: String) -> CommandResult<String> {
+pub(crate) fn add_root(app: AppHandle, path: String) -> CommandResult<AddRootResult> {
     let canonical = canonicalize_folder(&path)?;
     let canonical_string = path_display(&canonical);
 
     let connection = open_database(&app)?;
-    add_or_get_root_id(&connection, &canonical_string)?;
-    write_root_index_marker(&canonical, 0)?;
-    Ok(canonical_string)
+    let root_id = add_or_get_root_id(&connection, &canonical_string)?;
+
+    let marker_path = root_index_marker_path(&canonical);
+    let marker_last_indexed_ms = fs::read_to_string(&marker_path)
+        .ok()
+        .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
+        .and_then(|value| value.get("lastIndexedMs").and_then(|field| field.as_i64()))
+        .unwrap_or(0);
+
+    let has_indexed_rows = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM files WHERE root_id = ?1 LIMIT 1)",
+            params![root_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|exists| exists != 0)
+        .map_err(|error| format!("Could not determine existing index rows: {error}"))?;
+
+    if !marker_path.is_file() {
+        write_root_index_marker(&canonical, 0)?;
+    }
+
+    let should_index = marker_last_indexed_ms <= 0 || !has_indexed_rows;
+
+    Ok(AddRootResult {
+        canonical_path: canonical_string,
+        should_index,
+    })
 }
 
 #[tauri::command]
@@ -1234,10 +1259,7 @@ fn latency_stats(samples: &[f64]) -> BenchmarkLatencyStats {
     }
 
     let mut sorted = samples.to_vec();
-    sorted.sort_by(|left, right| {
-        left.partial_cmp(right)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    sorted.sort_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal));
     let sum = sorted.iter().copied().sum::<f64>();
     BenchmarkLatencyStats {
         runs: sorted.len(),
@@ -1284,7 +1306,14 @@ fn query_candidates_from_text(text: &str) -> Vec<String> {
         candidates.push(head_three.join(" "));
     }
     if tokens.len() >= 2 {
-        candidates.push(tokens.iter().take(2).cloned().collect::<Vec<String>>().join(" "));
+        candidates.push(
+            tokens
+                .iter()
+                .take(2)
+                .cloned()
+                .collect::<Vec<String>>()
+                .join(" "),
+        );
     }
     candidates.push(tokens[0].clone());
     if tokens.len() >= 4 {
@@ -1354,7 +1383,8 @@ fn collect_benchmark_queries(
         if queries.len() >= max_queries {
             break;
         }
-        let text = row.map_err(|error| format!("Could not parse benchmark heading text: {error}"))?;
+        let text =
+            row.map_err(|error| format!("Could not parse benchmark heading text: {error}"))?;
         for candidate in query_candidates_from_text(&text) {
             if queries.len() >= max_queries {
                 break;
@@ -1382,7 +1412,8 @@ fn collect_benchmark_queries(
         if queries.len() >= max_queries {
             break;
         }
-        let text = row.map_err(|error| format!("Could not parse benchmark author text: {error}"))?;
+        let text =
+            row.map_err(|error| format!("Could not parse benchmark author text: {error}"))?;
         for candidate in query_candidates_from_text(&text) {
             if queries.len() >= max_queries {
                 break;
@@ -1429,12 +1460,7 @@ fn collect_benchmark_queries(
             "conclusion",
             "references",
         ] {
-            push_query_candidate(
-                &mut queries,
-                &mut seen,
-                fallback.to_string(),
-                max_queries,
-            );
+            push_query_candidate(&mut queries, &mut seen, fallback.to_string(), max_queries);
         }
     }
 
@@ -1461,9 +1487,13 @@ fn sample_file_ids(
             LIMIT ?2
             ",
         )
-        .map_err(|error| format!("Could not prepare benchmark file preview sample query: {error}"))?;
+        .map_err(|error| {
+            format!("Could not prepare benchmark file preview sample query: {error}")
+        })?;
     let rows = statement
-        .query_map(params![root_id_value, limit_i64], |row| row.get::<_, i64>(0))
+        .query_map(params![root_id_value, limit_i64], |row| {
+            row.get::<_, i64>(0)
+        })
         .map_err(|error| format!("Could not run benchmark file preview sample query: {error}"))?;
 
     let mut output = Vec::new();
@@ -1501,7 +1531,9 @@ fn sample_heading_refs(
         .query_map(params![root_id_value, limit_i64], |row| {
             Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
         })
-        .map_err(|error| format!("Could not run benchmark heading preview sample query: {error}"))?;
+        .map_err(|error| {
+            format!("Could not run benchmark heading preview sample query: {error}")
+        })?;
 
     let mut output = Vec::new();
     for row in rows {
@@ -1526,7 +1558,7 @@ pub(crate) async fn benchmark_root_performance(
     let canonical_root = canonicalize_folder(&path)?;
     let root_path = path_display(&canonical_root);
 
-    add_root(app.clone(), root_path.clone())?;
+    let _ = add_root(app.clone(), root_path.clone())?;
     let index_full = index_root(app.clone(), root_path.clone())?;
     let index_incremental = index_root(app.clone(), root_path.clone())?;
 
@@ -1716,8 +1748,8 @@ pub(crate) async fn benchmark_root_performance(
         match get_file_preview(app.clone(), file_id) {
             Ok(file_preview) => {
                 file_preview_samples.push(elapsed_ms(started));
-                file_preview_hits =
-                    file_preview_hits.saturating_add(usize::try_from(file_preview.heading_count).unwrap_or(0));
+                file_preview_hits = file_preview_hits
+                    .saturating_add(usize::try_from(file_preview.heading_count).unwrap_or(0));
             }
             Err(error) => {
                 file_preview_error = Some(error);

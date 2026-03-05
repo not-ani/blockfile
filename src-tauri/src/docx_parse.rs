@@ -169,6 +169,19 @@ pub(crate) fn run_highlight_class(run: Node<'_, '_>) -> Option<&'static str> {
     }
 }
 
+pub(crate) fn run_underline_class(run: Node<'_, '_>) -> Option<&'static str> {
+    let props = run_properties_node(run)?;
+    let highlight = props.children().find(|node| has_tag(*node, "underline"))?;
+
+    let value = attribute_value(highlight, "val")?
+        .trim()
+        .to_ascii_lowercase();
+
+    match value.as_str() {
+        _ => None,
+    }
+}
+
 pub(crate) fn detect_heading_level(
     paragraph: Node<'_, '_>,
     style_map: &HashMap<String, String>,
